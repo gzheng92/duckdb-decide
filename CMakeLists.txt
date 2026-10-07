@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.15)
+project(decide)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(CURL REQUIRED)
+include_directories(src/include third_party)
+build_loadable_extension(decide "" src/decide_extension.cpp)
+target_link_libraries(decide_loadable_extension CURL::libcurl)
