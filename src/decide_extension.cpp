@@ -6,6 +6,7 @@
 #include "duckdb/main/config.hpp"
 #include "client.hpp"
 #include <cstdlib>
+#include <map>
 namespace duckdb {
 using decide::Json;
 static unique_ptr<BaseSecret> CreateSecret(ClientContext &, CreateSecretInput &input) {
@@ -26,14 +27,60 @@ static decide::Config Configuration(ClientContext &context) {
     return config;
 }
 enum class Mode { Predicate, Probability, Choice, Score, Answers };
+struct PendingRow {
+    idx_t row;
+    string input;
+    Json questions;
+    double threshold;
+};
+struct PendingBatch {
+    vector<PendingRow *> rows;
+    string input;
+    Json questions;
+};
+// Split large batches before issuing any requests. A singleton keeps the original
+// input and question, so batch_size=1 is a direct comparison baseline.
+static void PlanBatch(const vector<PendingRow *> &rows, vector<PendingBatch> &batches) {
+    PendingBatch batch;
+    batch.rows = rows;
+    if (rows.size() == 1) {
+        batch.input = rows[0]->input;
+        batch.questions = rows[0]->questions;
+    } else {
+        Json evidence = Json::array();
+        batch.questions = Json::array();
+        for (auto *row : rows) {
+            auto id = "row_" + std::to_string(row->row);
+            evidence.push_back({{"id", id}, {"text", row->input}});
+            auto question = row->questions[0];
+            question["name"] = id;
+            question["instructions"] = "The input is a JSON object containing rows. Evaluate only the text of the "
+                "record whose id is " + id + ". Ignore all other records. Question: " +
+                question["instructions"].get<string>();
+            batch.questions.push_back(std::move(question));
+        }
+        batch.input = Json({{"rows", evidence}}).dump();
+    }
+    auto bytes = Json({{"model", "gpt-6-luna"}, {"input", batch.input}, {"questions", batch.questions}}).dump().size();
+    if (bytes > decide::MAX_BYTES) {
+        if (rows.size() == 1) throw std::runtime_error("Request exceeds extension's 16 MiB limit");
+        auto middle = rows.begin() + rows.size() / 2;
+        PlanBatch(vector<PendingRow *>(rows.begin(), middle), batches);
+        PlanBatch(vector<PendingRow *>(middle, rows.end()), batches);
+        return;
+    }
+    batches.push_back(std::move(batch));
+}
 template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
     result.SetVectorType(VectorType::FLAT_VECTOR);
-    bool configured = false; decide::Config config;
-    for (idx_t row = 0; row < args.size(); ++row) {
-        bool missing = false;
-        for (idx_t col = 0; col < args.ColumnCount(); ++col) if (args.data[col].GetValue(row).IsNull()) missing = true;
-        if (missing) { result.SetValue(row, Value()); continue; }
-        try {
+    try {
+        vector<PendingRow> pending;
+        pending.reserve(args.size());
+        // Validate the entire chunk before making paid requests.
+        for (idx_t row = 0; row < args.size(); ++row) {
+            bool missing = false;
+            for (idx_t col = 0; col < args.ColumnCount(); ++col) if (args.data[col].GetValue(row).IsNull()) missing = true;
+            if (missing) { result.SetValue(row, Value()); continue; }
             auto input = args.data[0].GetValue(row).ToString();
             auto instructions = args.data[1].GetValue(row).ToString();
             Json questions;
@@ -56,17 +103,42 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
                 threshold = args.data[2].GetValue(row).GetValue<double>();
                 if (!std::isfinite(threshold) || threshold < 0 || threshold > 1) throw std::runtime_error("Threshold must be between 0 and 1");
             }
-            if (!configured) { config = Configuration(state.GetContext()); configured = true; }
-            auto answers = decide::Evaluate(config, input, questions);
-            if (MODE == Mode::Answers) { result.SetValue(row, Value(answers.dump())); continue; }
-            const auto &answer = answers[0];
-            if (answer["type"] == "refusal") throw std::runtime_error("OpenAI refused this decision");
-            if (MODE == Mode::Predicate) result.SetValue(row, Value(answer["probability"].get<double>() >= threshold));
-            if (MODE == Mode::Probability) result.SetValue(row, Value(answer["probability"].get<double>()));
-            if (MODE == Mode::Choice) result.SetValue(row, Value(answer["choice"].get<string>()));
-            if (MODE == Mode::Score) result.SetValue(row, Value(answer["score"].get<double>()));
-        } catch (const std::exception &e) { throw InvalidInputException("Decisions: %s", e.what()); }
-    }
+            pending.push_back({row, std::move(input), std::move(questions), threshold});
+        }
+        if (pending.empty()) return;
+        auto config = Configuration(state.GetContext());
+        if (MODE == Mode::Answers) {
+            // Preserve user-defined names and shared-input semantics for explicit questions.
+            for (const auto &row : pending) result.SetValue(row.row, Value(decide::Evaluate(config, row.input, row.questions).dump()));
+            return;
+        }
+        Value setting;
+        state.GetContext().TryGetCurrentSetting("decisions_batch_size", setting);
+        auto batch_size = setting.GetValue<uint64_t>();
+        if (batch_size < 1 || batch_size > 128) throw std::runtime_error("decisions_batch_size must be between 1 and 128");
+        std::map<string, vector<PendingRow *>> groups;
+        for (auto &row : pending) groups[row.questions.dump()].push_back(&row);
+        vector<PendingBatch> batches;
+        for (const auto &entry : groups) {
+            const auto &rows = entry.second;
+            for (idx_t start = 0; start < rows.size(); start += batch_size) {
+                auto end = MinValue<idx_t>(start + batch_size, rows.size());
+                PlanBatch(vector<PendingRow *>(rows.begin() + start, rows.begin() + end), batches);
+            }
+        }
+        for (const auto &batch : batches) {
+            auto answers = decide::Evaluate(config, batch.input, batch.questions);
+            for (idx_t i = 0; i < batch.rows.size(); ++i) {
+                const auto &row = *batch.rows[i];
+                const auto &answer = answers[i];
+                if (answer["type"] == "refusal") throw std::runtime_error("OpenAI refused this decision");
+                if (MODE == Mode::Predicate) result.SetValue(row.row, Value(answer["probability"].get<double>() >= row.threshold));
+                if (MODE == Mode::Probability) result.SetValue(row.row, Value(answer["probability"].get<double>()));
+                if (MODE == Mode::Choice) result.SetValue(row.row, Value(answer["choice"].get<string>()));
+                if (MODE == Mode::Score) result.SetValue(row.row, Value(answer["score"].get<double>()));
+            }
+        }
+    } catch (const std::exception &e) { throw InvalidInputException("Decisions: %s", e.what()); }
 }
 static void LoadInternal(ExtensionLoader &loader) {
     SecretType type; type.name = "decisions"; type.default_provider = "config"; type.extension = "decide";
@@ -74,6 +146,7 @@ static void LoadInternal(ExtensionLoader &loader) {
     CreateSecretFunction secret; secret.secret_type = "decisions"; secret.provider = "config"; secret.function = CreateSecret;
     secret.named_parameters["api_key"] = LogicalType::VARCHAR; loader.RegisterFunction(secret);
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_endpoint", "OpenAI Decisions URL; loopback HTTP allowed for mock tests", LogicalType::VARCHAR, Value("https://api.openai.com/v1/decisions"));
+    DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_batch_size", "Rows per request for typed functions (1 to 128)", LogicalType::UBIGINT, Value::UBIGINT(20));
     auto add = [&](const char *name, vector<LogicalType> args, LogicalType output, scalar_function_t fun) {
         ScalarFunction function(name, args, output, fun);
         function.SetStability(FunctionStability::VOLATILE);

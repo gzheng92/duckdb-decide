@@ -65,11 +65,27 @@ SELECT decision_answers('A customer reports a broken screen.', '[
 
 ## Execution and limits
 
-This initial version supports text and SQL records. It makes one synchronous
-HTTP request per non-NULL row, with no persistent cache or cross-row batching.
-The API's questions share one input; combining unrelated records would change
-the question's evidence. Functions are marked volatile to prevent the SQL
-optimizer from precomputing network calls. Repeating calls can incur repeated
+Typed functions batch up to **20 non-NULL rows per request** by default. Within
+each DuckDB chunk, rows with identical questions and options are grouped. Each
+request contains a JSON array of records, with one uniquely named question that
+explicitly targets each record. Results are checked for matching names, types,
+and counts before they are assigned back to SQL rows. NULL rows are skipped.
+Large batches are split to stay within the 16 MiB request limit.
+
+```sql
+SET decisions_batch_size = 20; -- allowed extension range: 1 through 128
+SET decisions_batch_size = 1;  -- disable cross-row batching; original input format
+```
+
+Batching shares evidence across records, so compare results against batch size 1
+on representative labeled data before choosing a larger batch. This is an
+extension technique using multiple API questions, not a native multi-input API.
+`decision_answers` preserves user-defined question names and makes one request
+per row; its explicit questions already share that row's input.
+
+Requests execute sequentially within each chunk. There is no persistent cache or
+extension-managed concurrency pool. Functions are marked volatile to prevent the
+SQL optimizer from precomputing network calls. Repeating calls can incur repeated
 charges, so materialize results you plan to reuse.
 
 Requests time out after 30 seconds (10-second connection timeout). HTTP 429 is
@@ -80,9 +96,11 @@ The extension limits request and response payloads to 16 MiB. It respects
 DuckDB's `enable_external_access=false` setting. Images and custom regional
 endpoints are not supported in this first version.
 
-Default builds resolve DuckDB symbols from the CLI at load time. For embedding
-runtimes that hide those symbols, use `EXTENSION_STATIC_BUILD=ON ./scripts/build.sh`
-to build a larger binary with DuckDB linked in. C++ extension binaries must match
+Default local builds resolve DuckDB symbols from the CLI at load time (verified
+with Homebrew on macOS). For Linux, embedding runtimes, or runtimes that hide
+C++ symbols, use `EXTENSION_STATIC_BUILD=ON ./scripts/build.sh` to build a larger
+binary with DuckDB linked in. CI uses this mode to avoid unresolved RTTI symbols
+when loading into the Linux CLI. C++ extension binaries must match
 the DuckDB version and platform.
 
 ## Tests

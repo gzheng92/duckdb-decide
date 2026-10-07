@@ -13,3 +13,15 @@
 
 The live result verifies endpoint access and parsing, not statistical calibration.
 Linux, Windows, embedded-runtime loading, and static builds have not been tested.
+
+## Batching update
+
+- Added configurable batches of 20 rows by default (extension range 1–128).
+- Mock tests confirm 45 rows use three requests of 20, 20, and 5 questions,
+  while batch size 1 uses individual requests.
+- Verified distinct row results, row-specific thresholds, varying questions,
+  choices, scores, skipped NULLs, 2,065 rows across DuckDB chunk boundaries,
+  per-question refusals and invalid answers, and splitting oversized requests.
+- Diagnosed the first Linux CI failure: loading the dynamically resolved
+  extension failed with missing RTTI symbol `_ZTIN6duckdb18BaseScalarFunctionE`.
+  CI now builds with `EXTENSION_STATIC_BUILD=ON`, linking DuckDB into the binary.
