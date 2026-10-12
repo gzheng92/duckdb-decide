@@ -29,9 +29,10 @@ Current community build inputs are DuckDB `v1.5.6` and extension-ci-tools
 `v1.5-variegata`. Recheck these before submitting; C++ extension artifacts are
 version- and platform-specific.
 
-The descriptor in this directory is a draft: its `repo.ref` placeholder prevents
-accidentally submitting an older implementation. CI for this repo does not read
-that descriptor; the upstream community repo does.
+The descriptor in this directory is a draft pinned to the prepared source commit.
+Require green distribution CI for that source revision before submission and
+refresh the ref if implementation changes are needed. CI for this repo does not
+read that descriptor; the upstream community repo does.
 
 Sources:
 - https://duckdb.org/community_extensions/documentation
