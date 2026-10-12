@@ -1,5 +1,6 @@
 #define DUCKDB_EXTENSION_MAIN
 #include "duckdb.hpp"
+#include "decide_extension.hpp"
 #include "duckdb/function/scalar_function.hpp"
 #include "duckdb/main/extension/extension_loader.hpp"
 #include "duckdb/main/secret/secret.hpp"
@@ -160,5 +161,8 @@ static void LoadInternal(ExtensionLoader &loader) {
     add("decision_score", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, LogicalType::DOUBLE, Execute<Mode::Score>);
     add("decision_answers", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::VARCHAR, Execute<Mode::Answers>);
 }
+void DecideExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
+std::string DecideExtension::Name() { return "decide"; }
+std::string DecideExtension::Version() const { return "0.1.0"; }
 }
 extern "C" { DUCKDB_CPP_EXTENSION_ENTRY(decide, loader) { duckdb::LoadInternal(loader); } }

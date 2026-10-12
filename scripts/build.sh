@@ -2,9 +2,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DUCKDB_COMMIT=069cc9f9b5be802405797faecc284961b07c70ef
-# Both tag and commit are checked.
+# Submodule checkouts may omit tags; fetch the release tag before validating it.
 if [ ! -e duckdb/.git ]; then
   git submodule update --init duckdb
+fi
+if ! git -C duckdb rev-parse --verify refs/tags/v1.5.6 >/dev/null 2>&1; then
+  git -C duckdb fetch --depth 1 origin tag v1.5.6
 fi
 if [ "$(git -C duckdb describe --tags --exact-match)" != "v1.5.6" ] || [ "$(git -C duckdb rev-parse HEAD)" != "$DUCKDB_COMMIT" ]; then
   echo 'Expected DuckDB v1.5.6 in duckdb/' >&2

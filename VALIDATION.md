@@ -52,3 +52,22 @@ sequential probe shows no reported cache benefit for the current request format;
 it does not establish that Decisions never caches or that another layout could
 not benefit. The long rubric deliberately repeats criteria to stress reusable
 instructions and is not a representative accuracy benchmark.
+
+## Community preparation — October 12, 2026
+
+- Standard `make release` completed on Apple Silicon using pinned DuckDB 1.5.6
+  and extension-ci-tools v1.5-variegata. Both static registration and the loadable
+  artifact are built; local dependencies came from the system curl library.
+- Standard `make test_release` ran the offline SQLLogicTest: 17 assertions passed,
+  with no skipped tests. Static registration is required for the pinned DuckDB
+  generated loader to discover the extension through `require decide`.
+- The HTTP mock suite passed with the installed Homebrew CLI loading the newly
+  built static-linked artifact, exercising the loadable entry point separately.
+- The current community descriptor parser accepted the draft descriptor. The
+  vcpkg curl feature names were checked against the official curl port manifest.
+- First preparation mock CI failed before compilation because its shallow
+  submodule checkout omitted the release tag. Checkout now fetches full history,
+  and the local build script fetches the expected tag when it is missing.
+- The official native distribution workflow has been configured. Its current
+  source revision must pass before submission; Windows, Intel macOS, Linux ARM,
+  and the vcpkg distribution dependency resolution are not yet locally verified.
