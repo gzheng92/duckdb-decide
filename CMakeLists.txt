@@ -3,6 +3,12 @@ project(decide)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(CURL REQUIRED)
+find_package(Threads REQUIRED)
 include_directories(src/include third_party)
+build_static_extension(decide src/decide_extension.cpp)
 build_loadable_extension(decide "" src/decide_extension.cpp)
-target_link_libraries(decide_loadable_extension CURL::libcurl)
+target_link_libraries(decide_extension CURL::libcurl Threads::Threads)
+target_link_libraries(decide_loadable_extension CURL::libcurl Threads::Threads)
+install(TARGETS decide_extension EXPORT "${DUCKDB_EXPORT_SET}"
+        LIBRARY DESTINATION "${INSTALL_LIB_DIR}"
+        ARCHIVE DESTINATION "${INSTALL_LIB_DIR}")

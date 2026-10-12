@@ -12,7 +12,9 @@
   damaged-parcel text succeeded. `decision_prob` returned 0.98.
 
 The live result verifies endpoint access and parsing, not statistical calibration.
-Linux, Windows, embedded-runtime loading, and static builds have not been tested.
+Subsequent Linux static build and mock integration CI passed:
+https://github.com/gzheng92/duckdb-decide/actions/runs/37670454336.
+Windows and embedded-runtime loading remain unverified.
 
 ## Batching update
 
@@ -25,3 +27,28 @@ Linux, Windows, embedded-runtime loading, and static builds have not been tested
 - Diagnosed the first Linux CI failure: loading the dynamically resolved
   extension failed with missing RTTI symbol `_ZTIN6duckdb18BaseScalarFunctionE`.
   CI now builds with `EXTENSION_STATIC_BUILD=ON`, linking DuckDB into the binary.
+
+## Prompt caching probe — October 8, 2026
+
+Ran `test/prompt_cache_live.py` against the live Decisions endpoint using synthetic
+parcel descriptions and the extension's current 20-row batch payload. This is a
+direct HTTP probe of equivalent requests, not instrumentation inside DuckDB.
+Each of three conditions used four sequential requests with two-second gaps;
+no cache controls were added. Full response usage is saved in
+`test/prompt_cache_results.json`.
+
+| Condition | Input tokens/request | Median seconds | Reported cached tokens |
+| --- | ---: | ---: | ---: |
+| Long rubric, identical repeated batch | 57,629 | 0.326 | 0 |
+| Long rubric, changing rows | 57,629 | 0.336 | 0 |
+| Short question, changing rows | 4,529 | 0.179 | 0 |
+
+All 12 requests reported zero cache-write tokens as well. All 240 row decisions
+matched the synthetic labels at threshold 0.5. Total reported input was 479,148
+tokens (approximately $0.048 at the published base Decisions input rate).
+The first identical request took 1.062 seconds; its repeats took 0.295–0.338
+seconds. That timing change alone does not prove prompt caching. This small,
+sequential probe shows no reported cache benefit for the current request format;
+it does not establish that Decisions never caches or that another layout could
+not benefit. The long rubric deliberately repeats criteria to stress reusable
+instructions and is not a representative accuracy benchmark.

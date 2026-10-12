@@ -7,6 +7,8 @@ jobs:
       EXTENSION_STATIC_BUILD: "ON"
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - run: ./scripts/build.sh
       - run: cmake --build build/release --target shell -j 4

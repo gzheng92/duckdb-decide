@@ -9,6 +9,10 @@ Requires Git, CMake, a C++17 compiler, libcurl development headers, Python 3 for
 mock tests, and DuckDB **1.5.6**. On an Apple Silicon Mac, Homebrew's tools are
 usually in `/opt/homebrew/bin`.
 
+Clone with `--recurse-submodules`, or run `git submodule update --init --recursive`.
+The repo includes the standard DuckDB extension Makefile and a vcpkg manifest for
+portable distribution builds: `make release` then `make test_release`.
+
 ```sh
 ./scripts/build.sh
 # Run with your installed DuckDB 1.5.6 CLI:
@@ -36,6 +40,9 @@ FROM patents p;
 
 Secrets are temporary by default, with API keys redacted from DuckDB's secret
 listing. The extension has no community distribution or signing yet.
+Community submission preparation and the draft descriptor are in
+[community/SUBMISSION.md](community/SUBMISSION.md). `INSTALL decide FROM community`
+will become available only after acceptance and publication.
 
 ## Functions
 

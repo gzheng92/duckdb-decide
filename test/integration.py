@@ -2,13 +2,14 @@
 import json
 import os
 import pathlib
+import shutil
 import subprocess
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 EXT = ROOT / 'build/release/extension/decide/decide.duckdb_extension'
-CLI = os.environ.get('DUCKDB_CLI', '/opt/homebrew/bin/duckdb')
+CLI = os.environ.get('DUCKDB_CLI') or shutil.which('duckdb') or str(ROOT / 'build/release/duckdb')
 requests = []
 attempts = 0
 

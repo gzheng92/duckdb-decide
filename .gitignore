@@ -1,5 +1,7 @@
-/duckdb/
 /build/
+/vcpkg/
+/.cache/
+/testext/
 __pycache__/
 .DS_Store
 .env

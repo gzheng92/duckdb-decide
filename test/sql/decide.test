@@ -1,0 +1,66 @@
+# name: test/sql/decide.test
+# description: offline contracts, secrets, and external-access enforcement
+# group: [sql]
+
+require decide
+
+query IIIII
+SELECT decision(NULL, 'Q') IS NULL, decision_prob('x', NULL) IS NULL,
+       decision_choice(NULL, 'Q', ['a']) IS NULL,
+       decision_score(NULL, 'Q', ['a', 'b']) IS NULL,
+       decision_answers(NULL, '[]') IS NULL;
+----
+true	true	true	true	true
+
+statement error
+SELECT decision_prob('x', '');
+----
+Question must not be empty
+
+statement error
+SELECT decision('x', 'Q', 1.1);
+----
+Threshold must be between 0 and 1
+
+statement error
+SELECT decision_choice('x', 'Q', ['a', 'a']);
+----
+Labels must be unique
+
+statement error
+SELECT decision_score('x', 'Q', ['a']);
+----
+Insufficient choices or score levels
+
+statement ok
+CREATE SECRET test_decisions (TYPE decisions, API_KEY 'offline-dummy-key');
+
+query I
+SELECT count(*) FROM duckdb_secrets()
+WHERE name = 'test_decisions' AND NOT persistent AND secret_string NOT LIKE '%offline-dummy-key%';
+----
+1
+
+query I
+SELECT current_setting('decisions_batch_size');
+----
+20
+
+statement ok
+SET decisions_batch_size = 0;
+
+statement error
+SELECT decision_prob('x', 'Q');
+----
+decisions_batch_size must be between 1 and 128
+
+statement ok
+SET decisions_batch_size = 20;
+
+statement ok
+SET enable_external_access = false;
+
+statement error
+SELECT decision_prob('x', 'Q');
+----
+Decisions requires external access
