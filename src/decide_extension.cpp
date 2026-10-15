@@ -23,8 +23,14 @@ static decide::Config Configuration(ClientContext &context) {
     decide::Config config;
     KeyValueSecretReader reader(DatabaseInstance::GetDatabase(context), "decisions", "decisions://");
     reader.TryGetSecretKey("api_key", config.key);
-    if (config.key.empty()) { const char *key = std::getenv("OPENAI_API_KEY"); if (key) config.key = key; }
+    Value provider; if (context.TryGetCurrentSetting("decisions_provider", provider)) config.provider = provider.ToString();
+    Value model; if (context.TryGetCurrentSetting("decisions_model", model)) config.model = model.ToString();
     Value endpoint; if (context.TryGetCurrentSetting("decisions_endpoint", endpoint)) config.endpoint = endpoint.ToString();
+    if (config.Cloudflare()) {
+        reader.TryGetSecretKey("account_id", config.account_id);
+        if (config.key.empty()) { const char *key = std::getenv("CLOUDFLARE_API_TOKEN"); if (key) config.key = key; }
+        if (config.account_id.empty()) { const char *id = std::getenv("CLOUDFLARE_ACCOUNT_ID"); if (id) config.account_id = id; }
+    } else if (config.key.empty()) { const char *key = std::getenv("OPENAI_API_KEY"); if (key) config.key = key; }
     return config;
 }
 enum class Mode { Predicate, Probability, Choice, Score, Answers };
@@ -117,6 +123,7 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         state.GetContext().TryGetCurrentSetting("decisions_batch_size", setting);
         auto batch_size = setting.GetValue<uint64_t>();
         if (batch_size < 1 || batch_size > 128) throw std::runtime_error("decisions_batch_size must be between 1 and 128");
+        if (config.Cloudflare()) batch_size = MinValue<uint64_t>(batch_size, decide::CLOUDFLARE_MAX_QUESTIONS);
         std::map<string, vector<PendingRow *>> groups;
         for (auto &row : pending) groups[row.questions.dump()].push_back(&row);
         vector<PendingBatch> batches;
@@ -132,7 +139,7 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
             for (idx_t i = 0; i < batch.rows.size(); ++i) {
                 const auto &row = *batch.rows[i];
                 const auto &answer = answers[i];
-                if (answer["type"] == "refusal") throw std::runtime_error("OpenAI refused this decision");
+                if (answer["type"] == "refusal") throw std::runtime_error(std::string(config.Name()) + " refused this decision");
                 if (MODE == Mode::Predicate) result.SetValue(row.row, Value(answer["probability"].get<double>() >= row.threshold));
                 if (MODE == Mode::Probability) result.SetValue(row.row, Value(answer["probability"].get<double>()));
                 if (MODE == Mode::Choice) result.SetValue(row.row, Value(answer["choice"].get<string>()));
@@ -145,8 +152,11 @@ static void LoadInternal(ExtensionLoader &loader) {
     SecretType type; type.name = "decisions"; type.default_provider = "config"; type.extension = "decide";
     type.deserializer = KeyValueSecret::Deserialize<KeyValueSecret>; loader.RegisterSecretType(type);
     CreateSecretFunction secret; secret.secret_type = "decisions"; secret.provider = "config"; secret.function = CreateSecret;
-    secret.named_parameters["api_key"] = LogicalType::VARCHAR; loader.RegisterFunction(secret);
+    secret.named_parameters["api_key"] = LogicalType::VARCHAR;
+    secret.named_parameters["account_id"] = LogicalType::VARCHAR; loader.RegisterFunction(secret);
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_endpoint", "OpenAI Decisions URL; loopback HTTP allowed for mock tests", LogicalType::VARCHAR, Value("https://api.openai.com/v1/decisions"));
+    DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_provider", "Backend: 'openai' (default) or 'cloudflare' (Workers AI Clef)", LogicalType::VARCHAR, Value("openai"));
+    DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_model", "Cloudflare model: 'clef' (default) or 'clef-flash'", LogicalType::VARCHAR, Value("clef"));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_batch_size", "Rows per request for typed functions (1 to 128)", LogicalType::UBIGINT, Value::UBIGINT(20));
     auto add = [&](const char *name, vector<LogicalType> args, LogicalType output, scalar_function_t fun) {
         ScalarFunction function(name, args, output, fun);

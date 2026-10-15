@@ -44,6 +44,27 @@ Community submission preparation and the draft descriptor are in
 [community/SUBMISSION.md](community/SUBMISSION.md). `INSTALL decide FROM community`
 will become available only after acceptance and publication.
 
+## Cloudflare Clef (Workers AI)
+
+The same functions can run on Cloudflare's open-weight
+[Clef](https://developers.cloudflare.com/workers-ai/models/clef/) decision models
+instead of OpenAI:
+
+```sql
+SET decisions_provider = 'cloudflare';
+SET decisions_model = 'clef';   -- or 'clef-flash' (9B, lower latency)
+CREATE SECRET cf_decisions (TYPE decisions, API_KEY 'workers-ai-token', ACCOUNT_ID 'your-account-id');
+-- Alternatively export CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
+SELECT decision_prob('Checkout fails for every customer.', 'Is this urgent?');
+```
+
+Predicates map to Clef `noul` questions, choices to `choice`, and scores to `score`
+(a probability-weighted index starting at 0), so results have the same meaning as
+with OpenAI. Differences: batches are capped at Clef's 64 questions per request;
+Clef truncates long text state to fit its 65,536-token context, so check long
+inputs; Clef has no refusal answers; and `decision_answers` question names may
+only use letters, digits, `_`, `.`, `-`. Images are not supported.
+
 ## Functions
 
 | Function | SQL result |
@@ -118,7 +139,7 @@ DUCKDB_CLI=/opt/homebrew/bin/duckdb python3 test/integration.py
 
 Tests use a loopback mock service, replace the API key with a dummy credential,
 and exercise the actual loadable extension. No live API calls are made by this
-suite. The `decisions_endpoint` setting accepts the fixed OpenAI endpoint or
+suite. The `decisions_endpoint` setting accepts the provider's fixed endpoint or
 HTTP on `127.0.0.1` for these tests; redirects are disabled.
 
 ## References
