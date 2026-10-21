@@ -29,3 +29,9 @@ Distribution compatibility is checked through DuckDB's reusable native-platform
 workflow. Browser/Wasm builds are excluded because the extension uses libcurl and
 native environment credentials. Adding a platform requires successful build and
 offline test results, not just a change to the descriptor.
+
+DuckDB's build tools rebuild their Linux Docker image on every run, downloading
+packages from public mirrors. When a mirror is down, the build fails before any of
+this repository's code compiles. The `Retry infrastructure failures` workflow re-runs
+the failed jobs once when the failure log shows such an outage. Any other failure,
+or a second failure, still needs a look.
