@@ -13,7 +13,7 @@ using decide::Json;
 static unique_ptr<BaseSecret> CreateSecret(ClientContext &, CreateSecretInput &input) {
     auto scopes = input.scope.empty() ? vector<string>{"decisions://"} : input.scope;
     auto secret = make_uniq<KeyValueSecret>(scopes, input.type, input.provider, input.name);
-    for (const auto &entry : input.options) secret->secret_map[entry.first] = entry.second;
+    for (const auto &entry : input.options) secret->secret_map[Identifier(entry.first)] = entry.second;
     secret->redact_keys.insert("api_key");
     return std::move(secret);
 }
@@ -146,6 +146,7 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
                 if (MODE == Mode::Score) result.SetValue(row.row, Value(answer["score"].get<double>()));
             }
         }
+    } catch (const Exception &) { throw; // Keep DuckDB's own error types, e.g. permission errors.
     } catch (const std::exception &e) { throw InvalidInputException("Decisions: %s", e.what()); }
 }
 static void LoadInternal(ExtensionLoader &loader) {
@@ -158,14 +159,18 @@ static void LoadInternal(ExtensionLoader &loader) {
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_provider", "Backend: 'openai' (default) or 'cloudflare' (Workers AI Clef)", LogicalType::VARCHAR, Value("openai"));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_model", "Cloudflare model: 'clef' (default) or 'clef-flash'", LogicalType::VARCHAR, Value("clef"));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_batch_size", "Rows per request for typed functions (1 to 128)", LogicalType::UBIGINT, Value::UBIGINT(20));
-    auto add = [&](const char *name, vector<LogicalType> args, LogicalType output, scalar_function_t fun) {
-        ScalarFunction function(name, args, output, fun);
+    auto make = [](const char *name, vector<LogicalType> args, LogicalType output, scalar_function_t fun) {
+        ScalarFunction function(name, std::move(args), std::move(output), fun);
         function.SetStability(FunctionStability::VOLATILE);
         function.SetNullHandling(FunctionNullHandling::SPECIAL_HANDLING);
-        loader.RegisterFunction(function);
+        function.SetFallible(); // HTTP, validation, and refusal errors are user-facing.
+        return function;
+    };
+    auto add = [&](const char *name, vector<LogicalType> args, LogicalType output, scalar_function_t fun) {
+        loader.RegisterFunction(make(name, std::move(args), std::move(output), fun));
     };
     add("decision", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::BOOLEAN, Execute<Mode::Predicate>);
-    loader.AddFunctionOverload(ScalarFunction("decision", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::DOUBLE}, LogicalType::BOOLEAN, Execute<Mode::Predicate>, nullptr, nullptr, nullptr, nullptr, LogicalType::INVALID, FunctionStability::VOLATILE, FunctionNullHandling::SPECIAL_HANDLING));
+    loader.AddFunctionOverload(make("decision", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::DOUBLE}, LogicalType::BOOLEAN, Execute<Mode::Predicate>));
     add("decision_prob", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::DOUBLE, Execute<Mode::Probability>);
     add("decision_choice", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, LogicalType::VARCHAR, Execute<Mode::Choice>);
     add("decision_score", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, LogicalType::DOUBLE, Execute<Mode::Score>);

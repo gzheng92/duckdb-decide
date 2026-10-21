@@ -25,8 +25,8 @@ an upstream PR or change repository visibility.
    version. Track new DuckDB releases and use `ref_next` when a separate source
    revision is needed for the upcoming release.
 
-Current community build inputs are DuckDB `v1.5.6` and extension-ci-tools
-`v1.5-variegata`. Recheck these before submitting; C++ extension artifacts are
+Current community build inputs are DuckDB `v2.0.0` (LTS) and extension-ci-tools
+`v2.0-cyanoptera`. Recheck these before submitting; C++ extension artifacts are
 version- and platform-specific.
 
 The descriptor in this directory is a draft pinned to the prepared source commit.

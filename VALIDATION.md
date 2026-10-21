@@ -71,3 +71,31 @@ instructions and is not a representative accuracy benchmark.
 - The official native distribution workflow has been configured. Its current
   source revision must pass before submission; Windows, Intel macOS, Linux ARM,
   and the vcpkg distribution dependency resolution are not yet locally verified.
+
+## DuckDB 2.0.0 LTS port — October 21, 2026
+
+- Moved the pinned DuckDB submodule to `v2.0.0` (`d54cbbe3df`) and
+  extension-ci-tools to `v2.0-cyanoptera` (`78bd1e4abb`).
+- Source changes for the 2.0 C++ API: secret option keys are now `Identifier`
+  values, and the threshold overload of `decision` is built without the
+  brace-list `ScalarFunction` constructor that 2.0 made ambiguous.
+- DuckDB 2.0 requires scalar functions that can throw to call `SetFallible()`.
+  Without it, every HTTP, validation, or refusal error became an
+  `INTERNAL Error`. All functions are now marked fallible. The mock suite
+  rejects `INTERNAL Error` output, and the SQLLogicTest expects
+  `Invalid Input Error`. The tightened mock suite failed before this fix.
+- DuckDB 2.0 no longer derives its version from git tags. `scripts/build.sh`
+  passes `DUCKDB_EXPLICIT_VERSION=v2.0.0`; otherwise local artifacts are stamped
+  `v2.0.0-dev1` and official 2.0.0 binaries reject them. The distribution workflow
+  exports `DUCKDB_VERSION` itself.
+- On Linux x86_64 (GCC), a static build with the bundled 2.0.0 CLI passed the HTTP
+  mock integration suite. The same artifact loaded in the official
+  `duckdb==2.0.0` Python wheel (`source_id d54cbbe3df`). Functions registered,
+  API keys were redacted, errors surfaced as `InvalidInputException`, and the
+  connection stayed usable afterward.
+- DuckDB errors raised inside the functions, such as the external-access
+  `PermissionException`, now pass through unchanged. Previously they were
+  re-wrapped as an `Invalid Input Error` that held a raw JSON error body.
+- Standard `make release` and `make test_release` passed, including the
+  SQLLogicTest. Windows, macOS, Linux ARM, and the vcpkg dependency resolution
+  are covered only by the distribution workflow, not by local runs.

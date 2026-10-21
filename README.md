@@ -6,7 +6,7 @@ Uses `https://api.openai.com/v1/decisions` and `gpt-6-luna`.
 ## Build and load
 
 Requires Git, CMake, a C++17 compiler, libcurl development headers, Python 3 for
-mock tests, and DuckDB **1.5.6**. On an Apple Silicon Mac, Homebrew's tools are
+mock tests, and DuckDB **2.0.0** (LTS). On an Apple Silicon Mac, Homebrew's tools are
 usually in `/opt/homebrew/bin`.
 
 Clone with `--recurse-submodules`, or run `git submodule update --init --recursive`.
@@ -15,7 +15,7 @@ portable distribution builds: `make release` then `make test_release`.
 
 ```sh
 ./scripts/build.sh
-# Run with your installed DuckDB 1.5.6 CLI:
+# Run with your installed DuckDB 2.0.0 CLI:
 duckdb -unsigned
 ```
 
