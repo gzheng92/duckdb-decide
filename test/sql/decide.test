@@ -15,22 +15,22 @@ true	true	true	true	true
 statement error
 SELECT decision_prob('x', '');
 ----
-Question must not be empty
+Invalid Input Error: Decisions: Question must not be empty
 
 statement error
 SELECT decision('x', 'Q', 1.1);
 ----
-Threshold must be between 0 and 1
+Invalid Input Error: Decisions: Threshold must be between 0 and 1
 
 statement error
 SELECT decision_choice('x', 'Q', ['a', 'a']);
 ----
-Labels must be unique
+Invalid Input Error: Decisions: Labels must be unique
 
 statement error
 SELECT decision_score('x', 'Q', ['a']);
 ----
-Insufficient choices or score levels
+Invalid Input Error: Decisions: Insufficient choices or score levels
 
 statement ok
 CREATE SECRET test_decisions (TYPE decisions, API_KEY 'offline-dummy-key');
@@ -52,7 +52,7 @@ SET decisions_batch_size = 0;
 statement error
 SELECT decision_prob('x', 'Q');
 ----
-decisions_batch_size must be between 1 and 128
+Invalid Input Error: Decisions: decisions_batch_size must be between 1 and 128
 
 statement ok
 SET decisions_batch_size = 20;
@@ -63,4 +63,4 @@ SET enable_external_access = false;
 statement error
 SELECT decision_prob('x', 'Q');
 ----
-Decisions requires external access
+Permission Error: Decisions requires external access

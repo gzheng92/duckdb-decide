@@ -146,6 +146,7 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
                 if (MODE == Mode::Score) result.SetValue(row.row, Value(answer["score"].get<double>()));
             }
         }
+    } catch (const Exception &) { throw; // Keep DuckDB's own error types, e.g. permission errors.
     } catch (const std::exception &e) { throw InvalidInputException("Decisions: %s", e.what()); }
 }
 static void LoadInternal(ExtensionLoader &loader) {
@@ -173,6 +174,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 }
 void DecideExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
 std::string DecideExtension::Name() { return "decide"; }
-std::string DecideExtension::Version() const { return "0.1.0"; }
+std::string DecideExtension::Version() const {
+#ifdef EXT_VERSION_DECIDE
+    return EXT_VERSION_DECIDE; // From EXTENSION_VERSION in extension_config.cmake.
+#else
+    return "";
+#endif
+}
 }
 extern "C" { DUCKDB_CPP_EXTENSION_ENTRY(decide, loader) { duckdb::LoadInternal(loader); } }

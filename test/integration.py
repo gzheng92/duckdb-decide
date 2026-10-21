@@ -112,6 +112,7 @@ def run(sql, fail=None, prefix=setup):
                        env={**os.environ, 'OPENAI_API_KEY': '', 'CLOUDFLARE_API_TOKEN': '', 'CLOUDFLARE_ACCOUNT_ID': ''})
     if fail:
         assert p.returncode and fail in p.stderr, (sql, p.stderr)
+        assert 'INTERNAL Error' not in p.stderr, (sql, p.stderr)
         return
     assert p.returncode == 0, p.stderr
     output = p.stdout.strip()

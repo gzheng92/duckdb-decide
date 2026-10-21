@@ -1,5 +1,9 @@
 name: Community distribution compatibility
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: ['**']  # release tags build in release.yml
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 concurrency:

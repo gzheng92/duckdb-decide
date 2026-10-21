@@ -71,3 +71,15 @@ instructions and is not a representative accuracy benchmark.
 - The official native distribution workflow has been configured. Its current
   source revision must pass before submission; Windows, Intel macOS, Linux ARM,
   and the vcpkg distribution dependency resolution are not yet locally verified.
+
+## v1.x maintenance line — October 21, 2026
+
+- Branch `v1.x` keeps DuckDB 1.5.6 support as the `0.1.*` release series. DuckDB
+  2.0 is maintained on `v2.x` as `0.2.*`.
+- Backported from the 2.0 port: DuckDB errors such as the external-access
+  `PermissionException` pass through unchanged instead of being re-wrapped as JSON.
+  The tests now reject `INTERNAL Error` and match exact error types.
+- On Linux x86_64, `make release`, `make test_release` (17 assertions), and the HTTP
+  mock suite passed. The artifact reported version `0.1.1` in the official
+  `duckdb==1.5.6` Python package. Official DuckDB 2.0.0 rejected it as built for
+  v1.5.6, as expected.

@@ -1,0 +1,83 @@
+name: Release
+# Pushing a tag such as v0.1.1 builds every supported platform for this branch's
+# DuckDB line and publishes the binaries as a GitHub Release. See RELEASING.md.
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      duckdb_version: ${{ steps.line.outputs.duckdb_version }}
+      latest: ${{ steps.line.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag against release line
+        id: line
+        run: |
+          ./scripts/check_release.sh "$GITHUB_REF_NAME"
+          source release.env
+          echo "duckdb_version=$DUCKDB_VERSION" >> "$GITHUB_OUTPUT"
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
+    with:
+      duckdb_version: v1.5.6
+      ci_tools_version: v1.5-variegata
+      extension_name: decide
+      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads"
+
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+      DUCKDB_VERSION: ${{ needs.check.outputs.duckdb_version }}
+      LATEST: ${{ needs.check.outputs.latest }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: decide-${{ needs.check.outputs.duckdb_version }}-extension-*
+      - name: Collect binaries
+        run: |
+          mkdir dist
+          prefix="decide-$DUCKDB_VERSION-extension-"
+          for dir in artifacts/"$prefix"*; do
+            platform=${dir#artifacts/$prefix}
+            files=$(find "$dir" -name '*.duckdb_extension')
+            [ "$(echo "$files" | grep -c .)" = 1 ] || { echo "expected one binary in $dir" >&2; exit 1; }
+            cp "$files" "dist/decide-$TAG-duckdb-$DUCKDB_VERSION-$platform.duckdb_extension"
+          done
+          ls dist | grep -q . || { echo "no binaries were built" >&2; exit 1; }
+          (cd dist && sha256sum * > SHA256SUMS)
+          ls -l dist
+      - name: Publish release
+        run: |
+          cat > notes.md <<NOTES
+          Built for **DuckDB $DUCKDB_VERSION**. DuckDB loads an extension only into the
+          version it was built for. For another DuckDB release, use the matching line in the
+          [compatibility table](https://github.com/$GITHUB_REPOSITORY#duckdb-compatibility).
+
+          Download the binary for your platform, then:
+
+          \`\`\`sql
+          -- start DuckDB with -unsigned (CLI) or allow_unsigned_extensions=true
+          LOAD 'path/to/decide-$TAG-duckdb-$DUCKDB_VERSION-<platform>.duckdb_extension';
+          \`\`\`
+
+          Verify downloads with \`SHA256SUMS\`.
+          NOTES
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --verify-tag \
+            --title "decide $TAG for DuckDB $DUCKDB_VERSION" --notes-file notes.md \
+            --latest="$LATEST"
