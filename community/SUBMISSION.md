@@ -16,7 +16,7 @@ an upstream PR or change repository visibility.
 4. Fork `duckdb/community-extensions`, create a branch, and copy only the completed
    descriptor into `extensions/decide/description.yml`. Open a PR to that repo.
    Explain the paid external API dependency, text-only scope, batch semantics,
-   native libcurl dependency, and Wasm exclusions.
+   native libcurl dependency, and the Wasm and Intel macOS exclusions.
 5. Address review and upstream build/test results. The community workflow builds
    the pinned public source with DuckDB's toolchain; merging triggers distribution.
    After publication, verify `INSTALL decide FROM community; LOAD decide;` on a

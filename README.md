@@ -15,7 +15,8 @@ DuckDB line has its own branch and release series:
 
 Prebuilt binaries for each release are attached to
 [GitHub Releases](https://github.com/gzheng92/duckdb-decide/releases); pick the release
-matching your DuckDB version. Fixes land on both lines while 1.5.x is supported.
+matching your DuckDB version. Supported platforms: Linux (x86_64, ARM64), macOS on
+Apple Silicon, and Windows (x86_64). Intel Macs and DuckDB-Wasm are not supported. Fixes land on both lines while 1.5.x is supported.
 See [RELEASING.md](RELEASING.md).
 
 ## Build and load

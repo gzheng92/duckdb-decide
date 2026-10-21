@@ -16,4 +16,4 @@ jobs:
       duckdb_version: v2.0.0
       ci_tools_version: v2.0-cyanoptera
       extension_name: decide
-      exclude_archs: "wasm_mvp;wasm_eh;wasm_threads"
+      exclude_archs: "osx_amd64;wasm_mvp;wasm_eh;wasm_threads"
