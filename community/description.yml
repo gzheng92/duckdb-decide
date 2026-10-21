@@ -1,11 +1,11 @@
 extension:
   name: decide
   description: Filter, classify, and score text using OpenAI Decisions from SQL
-  version: 0.1.0
+  version: 0.2.0
   language: C++
   build: cmake
   license: MIT
-  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads"
+  excluded_platforms: "osx_amd64;wasm_mvp;wasm_eh;wasm_threads"
   maintainers:
     - gzheng92
 repo:
