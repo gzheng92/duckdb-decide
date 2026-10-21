@@ -10,6 +10,7 @@ version=$(sed -n 's/.*EXTENSION_VERSION \([0-9][0-9.]*\).*/\1/p' extension_confi
 [ -n "$version" ] || fail "no EXTENSION_VERSION in extension_config.cmake"
 case "$version" in "$SERIES".*) ;; *) fail "version $version is outside the $SERIES.x series for DuckDB $DUCKDB_VERSION" ;; esac
 grep -q "^  version: $version$" community/description.yml || fail "community/description.yml version differs from $version"
+grep -q "^  excluded_platforms: \"$EXCLUDED_PLATFORMS\"$" community/description.yml || fail "community/description.yml excluded_platforms differs from $EXCLUDED_PLATFORMS"
 
 submodule=$(git ls-tree HEAD duckdb | awk '{print $3}')
 [ "$submodule" = "$DUCKDB_COMMIT" ] || fail "duckdb submodule is $submodule, expected $DUCKDB_COMMIT"
@@ -18,6 +19,7 @@ for workflow in .github/workflows/distribution.yml .github/workflows/release.yml
   grep -q "_extension_distribution.yml@$CI_TOOLS_VERSION$" "$workflow" || fail "$workflow does not use ci-tools $CI_TOOLS_VERSION"
   grep -q "duckdb_version: $DUCKDB_VERSION$" "$workflow" || fail "$workflow does not build DuckDB $DUCKDB_VERSION"
   grep -q "ci_tools_version: $CI_TOOLS_VERSION$" "$workflow" || fail "$workflow ci_tools_version differs from $CI_TOOLS_VERSION"
+  grep -q "exclude_archs: \"$EXCLUDED_PLATFORMS\"$" "$workflow" || fail "$workflow exclude_archs differs from $EXCLUDED_PLATFORMS"
 done
 
 if [ $# -gt 0 ]; then
