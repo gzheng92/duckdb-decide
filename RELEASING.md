@@ -9,6 +9,10 @@ for, so one release cannot serve both lines.
 | `v2.x` | v2.0.0 (LTS) | `v2.0-cyanoptera` | `0.2.*` | yes |
 | `v1.x` | v1.5.6 | `v1.5-variegata` | `0.1.*` | no |
 
+`main` is the default branch and mirrors the newest line (`v2.x`). Land changes
+for that line on `v2.x`, then fast-forward `main` to it
+(`git push origin v2.x:main`). Release from `v2.x`, not `main`.
+
 `release.env` on each branch records its line. `scripts/check_release.sh` runs in CI
 and before every release. It fails when the extension version, community descriptor,
 DuckDB submodule, `.gitmodules`, or workflow pins disagree with that file.
