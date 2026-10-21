@@ -1,7 +1,7 @@
 extension:
   name: decide
   description: Filter, classify, and score text using OpenAI Decisions from SQL
-  version: 0.1.0
+  version: 0.2.0
   language: C++
   build: cmake
   license: MIT

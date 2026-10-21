@@ -178,6 +178,12 @@ static void LoadInternal(ExtensionLoader &loader) {
 }
 void DecideExtension::Load(ExtensionLoader &loader) { LoadInternal(loader); }
 std::string DecideExtension::Name() { return "decide"; }
-std::string DecideExtension::Version() const { return "0.1.0"; }
+std::string DecideExtension::Version() const {
+#ifdef EXT_VERSION_DECIDE
+    return EXT_VERSION_DECIDE; // From EXTENSION_VERSION in extension_config.cmake.
+#else
+    return "";
+#endif
+}
 }
 extern "C" { DUCKDB_CPP_EXTENSION_ENTRY(decide, loader) { duckdb::LoadInternal(loader); } }

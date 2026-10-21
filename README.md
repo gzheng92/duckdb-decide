@@ -3,6 +3,21 @@
 A native DuckDB extension for the **OpenAI Decisions API public beta**.
 Uses `https://api.openai.com/v1/decisions` and `gpt-6-luna`.
 
+## DuckDB compatibility
+
+DuckDB loads an extension only into the DuckDB version it was built for, so each
+DuckDB line has its own branch and release series:
+
+| DuckDB | Branch | Extension releases |
+| --- | --- | --- |
+| 2.0.x (LTS) | [`v2.x`](https://github.com/gzheng92/duckdb-decide/tree/v2.x) | `v0.2.*` |
+| 1.5.x | [`v1.x`](https://github.com/gzheng92/duckdb-decide/tree/v1.x) | `v0.1.*` |
+
+Prebuilt binaries for each release are attached to
+[GitHub Releases](https://github.com/gzheng92/duckdb-decide/releases); pick the release
+matching your DuckDB version. Fixes land on both lines while 1.5.x is supported.
+See [RELEASING.md](RELEASING.md).
+
 ## Build and load
 
 Requires Git, CMake, a C++17 compiler, libcurl development headers, Python 3 for
