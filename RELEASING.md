@@ -23,16 +23,17 @@ DuckDB submodule, `.gitmodules`, or workflow pins disagree with that file.
    new DuckDB line.
 3. Push, and wait for `Build and test` and `Community distribution compatibility`
    to pass on that commit.
-4. Tag that commit and push the tag:
+4. Release it in one of two ways:
+   - In the Actions tab, run the `Release` workflow on the branch (`v1.x` or `v2.x`).
+     It releases the branch's current version and creates the tag.
+   - Or tag the tested commit and push the tag:
+     `git tag v0.2.1 && git push origin v0.2.1`.
 
-   ```sh
-   git tag v0.2.1 && git push origin v0.2.1
-   ```
-
-   The `Release` workflow checks that the tag matches the branch's version. It then
-   builds and tests every supported platform for that DuckDB version and publishes a
-   GitHub Release with one binary per platform and a `SHA256SUMS` file. Releases
-   from `v1.x` are not marked as the repository's latest release.
+   The workflow checks that the version belongs to the branch and isn't already
+   released. It then builds and tests every supported platform for that DuckDB
+   version and publishes a GitHub Release with one binary per platform and a
+   `SHA256SUMS` file. Releases from `v1.x` are not marked as the repository's
+   latest release.
 
 ## Starting a new DuckDB line
 
