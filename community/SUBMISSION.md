@@ -1,47 +1,46 @@
-# Submission procedure
+# Community distribution and maintenance
 
-Checked against DuckDB's community documentation and current build workflow on
-October 12, 2026. The repository remains private; this preparation does not submit
-an upstream PR or change repository visibility.
+`decide` was accepted into DuckDB Community Extensions on October 23, 2026:
+[submission PR #3037](https://github.com/duckdb/community-extensions/pull/3037).
+The source repository is public, and signed community binaries are available
+for DuckDB 2.0.0 on supported platforms:
 
-1. Pass `Community distribution compatibility` and `Build and test` for the
-   preparation branch. Resolve platform failures or explicitly exclude affected
-   platforms in both the distribution workflow and descriptor.
-2. Review the source, dependencies, README, and repository history before making
-   `gzheng92/duckdb-decide` public. DuckDB requires a public, open-source GitHub repo.
-3. Merge the preparation changes. Set `repo.ref` in `description.yml` to the full
-   tested commit SHA containing the implementation. Confirm version `0.2.0` and
-   maintainer `gzheng92`. A release tag is useful but not required by the documented
-   submission procedure; the descriptor should pin an immutable commit.
-4. Fork `duckdb/community-extensions`, create a branch, and copy only the completed
-   descriptor into `extensions/decide/description.yml`. Open a PR to that repo.
-   Explain the paid external API dependency, text-only scope, batch semantics,
-   native libcurl dependency, and the Wasm and Intel macOS exclusions.
-5. Address review and upstream build/test results. The community workflow builds
-   the pinned public source with DuckDB's toolchain; merging triggers distribution.
-   After publication, verify `INSTALL decide FROM community; LOAD decide;` on a
-   supported DuckDB version/platform. Users then supply their own OpenAI key.
-6. For updates, submit a descriptor PR with a new tested commit and extension
-   version. Track new DuckDB releases and use `ref_next` when a separate source
-   revision is needed for the upcoming release.
+```sql
+INSTALL decide FROM community;
+LOAD decide;
+```
 
-The community repository builds only for DuckDB's latest stable release, using
-`repo.ref`; `ref_next` covers DuckDB's development branch before a release.
-Submit the `v2.x` line. Releases for DuckDB 1.5.x come from the `v1.x` branch as
-GitHub Releases (see RELEASING.md); users on 1.5.x keep the last community build
-made for that version.
+The accepted source includes both OpenAI Decisions and Cloudflare Clef support.
+A [documentation correction, PR #3347](https://github.com/duckdb/community-extensions/pull/3347),
+updates the generated listing to describe Cloudflare as well.
 
-Current community build inputs are DuckDB `v2.0.0` (LTS) and extension-ci-tools
-`v2.0-cyanoptera`. Recheck these before submitting; C++ extension artifacts are
-version- and platform-specific.
+## Updating the community package
 
-The descriptor in this directory is a draft pinned to the prepared source commit.
-Require green distribution CI for that source revision before submission and
-refresh the ref if implementation changes are needed. CI for this repo does not
-read that descriptor; the upstream community repo does.
+1. Make source changes on the supported release line and pass `Build and test`
+   and `Community distribution compatibility` CI. Keep credentials and private
+   inputs out of source, fixtures, and logs.
+2. Update the descriptor's extension version and pin `repo.ref` to a full tested
+   public commit SHA. Keep provider documentation and platform exclusions aligned
+   with that source revision.
+3. Open a PR to `duckdb/community-extensions` changing only
+   `extensions/decide/description.yml`, and address upstream review and build
+   results. Documentation-only updates can retain the current source pin/version.
+4. After deployment, verify installation and loading in the matching official
+   DuckDB runtime. API evaluation requires the user's own provider credentials.
+
+The community repository builds for DuckDB's latest stable release. The current
+line is DuckDB `v2.0.0` with extension-ci-tools `v2.0-cyanoptera`, and extension
+releases `0.2.*`. Recheck upstream build inputs when upgrading; C++ extension
+artifacts are version- and platform-specific.
+
+DuckDB 1.5.x releases remain on `v1.x` as `0.1.*` GitHub releases; see
+[RELEASING.md](../RELEASING.md). GitHub release and local build artifacts are
+installed separately from signed community packages.
+
+The descriptor in this directory is the maintained template for registry
+updates. The upstream registry reads its own copy, not this file.
 
 Sources:
 - https://duckdb.org/community_extensions/documentation
 - https://duckdb.org/community_extensions/development
 - https://github.com/duckdb/community-extensions/blob/main/.github/workflows/build.yml
-- https://github.com/duckdb/extension-template
