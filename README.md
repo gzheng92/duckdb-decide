@@ -1,7 +1,21 @@
 # duckdb-decide
 
-A native DuckDB extension for the **OpenAI Decisions API public beta**.
-Uses `https://api.openai.com/v1/decisions` and `gpt-6-luna`.
+A native DuckDB extension for **OpenAI Decisions** and **Cloudflare Clef (Workers AI)**.
+Filter, classify, and score text with the same SQL functions using either provider.
+
+## Install from community
+
+`decide` is available in the [DuckDB Community Extensions repository](https://duckdb.org/community_extensions/extensions/decide)
+for DuckDB **2.0.0** on supported platforms:
+
+```sql
+INSTALL decide FROM community;
+LOAD decide;
+```
+
+Community builds are signed and load in the normal DuckDB CLI. Configure your
+provider credentials before evaluating rows; see the examples below and
+[Cloudflare setup](#cloudflare-clef-workers-ai).
 
 ## DuckDB compatibility
 
@@ -20,7 +34,7 @@ Apple Silicon, and Windows (x86_64). Intel Macs and DuckDB-Wasm are not supporte
 Fixes land on both lines while 1.5.x is supported.
 See [RELEASING.md](RELEASING.md).
 
-## Build and load
+## Build from source
 
 Requires Git, CMake, a C++17 compiler, libcurl development headers, Python 3 for
 mock tests, and DuckDB **2.0.0** (LTS). On an Apple Silicon Mac, Homebrew's tools are
@@ -56,10 +70,9 @@ FROM patents p;
 ```
 
 Secrets are temporary by default, with API keys redacted from DuckDB's secret
-listing. The extension has no community distribution or signing yet.
-Community submission preparation and the draft descriptor are in
-[community/SUBMISSION.md](community/SUBMISSION.md). `INSTALL decide FROM community`
-will become available only after acceptance and publication.
+listing. The `-unsigned` flag above is for local build artifacts; community
+installation does not require it. The accepted submission and maintenance
+procedure are documented in [community/SUBMISSION.md](community/SUBMISSION.md).
 
 ## Cloudflare Clef (Workers AI)
 
