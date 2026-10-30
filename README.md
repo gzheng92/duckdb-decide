@@ -1,7 +1,10 @@
 # duckdb-decide
 
-A native DuckDB extension for the **OpenAI Decisions API public beta**.
-Uses `https://api.openai.com/v1/decisions` and `gpt-6-luna`.
+A native DuckDB extension that asks decision models yes/no, multiple-choice, and
+rubric questions from SQL. It supports the **OpenAI Decisions API** (`gpt-6-luna`,
+the default), **TypeSafe Jev**, and **Cloudflare Clef**. Each provider is a small
+JSON file in [`providers/`](providers/), so other hosts with a supported API format
+can be added without new code.
 
 ## DuckDB compatibility
 
@@ -61,26 +64,67 @@ Community submission preparation and the draft descriptor are in
 [community/SUBMISSION.md](community/SUBMISSION.md). `INSTALL decide FROM community`
 will become available only after acceptance and publication.
 
-## Cloudflare Clef (Workers AI)
+## Providers
 
-The same functions can run on Cloudflare's open-weight
-[Clef](https://developers.cloudflare.com/workers-ai/models/clef/) decision models
-instead of OpenAI:
+| Provider | `decisions_provider` | Default model | Key variable |
+| --- | --- | --- | --- |
+| OpenAI Decisions | `openai` (default) | `gpt-6-luna` | `OPENAI_API_KEY` |
+| [TypeSafe Jev](https://docs.typesafe.ai/api) | `jev` | `jev-latest` | `TYPESAFE_API_KEY` |
+| [Cloudflare Clef](https://developers.cloudflare.com/workers-ai/models/clef/) | `cloudflare` | `clef` | `CLOUDFLARE_API_TOKEN` |
+
+`SELECT * FROM decision_providers()` lists the providers built into your binary,
+with their formats, models, secret keys, and limits.
 
 ```sql
-SET decisions_provider = 'cloudflare';
-SET decisions_model = 'clef';   -- or 'clef-flash' (9B, lower latency)
-CREATE SECRET cf_decisions (TYPE decisions, API_KEY 'workers-ai-token', ACCOUNT_ID 'your-account-id');
--- Alternatively export CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
+SET decisions_provider = 'jev';
+SET decisions_model = 'jev-1.14.0';   -- optional; empty uses the provider's default
+CREATE SECRET jev_key (TYPE decisions, API_KEY 'your-typesafe-key', SCOPE 'decisions://jev');
+-- Alternatively export TYPESAFE_API_KEY before starting DuckDB.
 SELECT decision_prob('Checkout fails for every customer.', 'Is this urgent?');
+
+SET decisions_provider = 'cloudflare';
+SET decisions_model = 'clef-flash';   -- or 'clef'
+CREATE SECRET cf_key (TYPE decisions, API_KEY 'workers-ai-token', ACCOUNT_ID 'your-account-id',
+                      SCOPE 'decisions://cloudflare');
+-- Alternatively export CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
 ```
 
-Predicates map to Clef `noul` questions, choices to `choice`, and scores to `score`
-(a probability-weighted index starting at 0), so results have the same meaning as
-with OpenAI. Differences: batches are capped at Clef's 64 questions per request;
-Clef truncates long text state to fit its 65,536-token context, so check long
-inputs; Clef has no refusal answers; and `decision_answers` question names may
-only use letters, digits, `_`, `.`, `-`. Images are not supported.
+**Keep keys per provider.** A secret without `SCOPE` is used for every provider,
+so switching `decisions_provider` would send that key to a different company.
+Scope each key with `SCOPE 'decisions://<provider>'`. A scoped secret takes
+precedence over an unscoped one. `decisions_model` applies to whichever provider
+is selected, so reset it (`RESET decisions_model`) when you switch.
+
+Jev and Clef share the "System One" request format. Predicates become `noul`
+questions, choices `choice`, and scores `score` (a probability-weighted index
+starting at 0), so results mean the same as with OpenAI. Neither returns refusal
+answers. Clef has extra limits: 64 questions per request (so batches are capped
+at 64), question names of letters, digits, `_`, `.`, `-` only, and truncation of
+long text to fit its 65,536-token context. Jev has no question cap and a
+64K-token request limit (32K for the input plus any one question). Images are
+not supported for any provider.
+
+### Adding a provider
+
+A host that speaks the OpenAI Decisions format or the System One format needs only
+a JSON file in `providers/` and a rebuild. For example, a file for another Jev host
+(an illustration, not shipped or tested) could be:
+
+```json
+{
+  "name": "electronhub",
+  "display_name": "Electron Hub Jev",
+  "format": "systemone",
+  "url": "https://api.electronhub.ai/v1/systemone",
+  "default_model": "jev",
+  "key_env": "ELECTRONHUB_API_KEY"
+}
+```
+
+[`providers/README.md`](providers/README.md) documents every field. Provider files
+are compiled into the extension and checked when it loads and in CI. API keys are
+only sent to the URLs that shipped with your build. A new wire format needs a
+small C++ class registered in `WireFormats()` in `src/include/providers.hpp`.
 
 ## Functions
 
@@ -139,7 +183,7 @@ billing status is ambiguous. Other HTTP failures are surfaced by status code;
 response bodies, input text, and API keys are not logged by the HTTP client.
 The extension limits request and response payloads to 16 MiB. It respects
 DuckDB's `enable_external_access=false` setting. Images and custom regional
-endpoints are not supported in this first version.
+endpoints are not supported.
 
 Default local builds resolve DuckDB symbols from the CLI at load time (verified
 with Homebrew on macOS). For Linux, embedding runtimes, or runtimes that hide
@@ -152,18 +196,24 @@ the DuckDB version and platform.
 
 ```sh
 DUCKDB_CLI=/opt/homebrew/bin/duckdb python3 test/integration.py
+c++ -std=c++17 -Isrc/include -Ithird_party test/providers_test.cpp -o providers_test
+./providers_test providers/*.json
 ```
 
 Tests use a loopback mock service, replace the API key with a dummy credential,
 and exercise the actual loadable extension. No live API calls are made by this
-suite. The `decisions_endpoint` setting accepts the provider's fixed endpoint or
-HTTP on `127.0.0.1` for these tests; redirects are disabled.
+suite. The `decisions_endpoint` setting is empty (use the provider's URL) or
+HTTP on `127.0.0.1` for these tests; redirects are disabled. `providers_test`
+checks every provider file with the extension's own parser, along with the
+validator's rejection of malformed files, without building DuckDB.
 
 ## References
 
 - [Official Decisions guide](https://developers.openai.com/api/docs/guides/decisions)
 - [Official API reference](https://developers.openai.com/api/reference/resources/decisions/methods/create)
+- [TypeSafe System One API reference](https://docs.typesafe.ai/api)
+- [Cloudflare Clef model page](https://developers.cloudflare.com/workers-ai/models/clef/)
 
 Probabilities are model estimates; set thresholds using labeled examples for your
-application. This project is an independent DuckDB integration, not an OpenAI or
-DuckDB official extension.
+application. This project is an independent DuckDB integration, not an official
+extension of OpenAI, TypeSafe, Cloudflare, or DuckDB.

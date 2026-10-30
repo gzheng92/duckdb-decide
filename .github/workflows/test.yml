@@ -15,6 +15,10 @@ jobs:
           fetch-depth: 0
           submodules: recursive
       - run: ./scripts/check_release.sh
+      - name: Check provider files
+        run: |
+          c++ -std=c++17 -Wall -Isrc/include -Ithird_party test/providers_test.cpp -o "$RUNNER_TEMP/providers_test"
+          "$RUNNER_TEMP/providers_test" providers/*.json
       - run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
       - run: ./scripts/build.sh
       - run: cmake --build build/release --target shell -j 4

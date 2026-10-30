@@ -1,0 +1,14 @@
+{
+  "name": "cloudflare",
+  "display_name": "Cloudflare Clef",
+  "format": "systemone",
+  "url": "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/run/@cf/cloudflare/{model}",
+  "default_model": "clef",
+  "models": ["clef", "clef-flash"],
+  "key_env": "CLOUDFLARE_API_TOKEN",
+  "params": [{"name": "account_id", "env": "CLOUDFLARE_ACCOUNT_ID", "pattern": "[0-9a-fA-F]{1,64}"}],
+  "max_questions": 64,
+  "question_names": {"pattern": "[A-Za-z0-9_.-]{1,100}", "rule": "letters, digits, '_', '.', '-' (max 100)"},
+  "response_wrapper": "result",
+  "docs": "https://developers.cloudflare.com/workers-ai/models/clef/"
+}

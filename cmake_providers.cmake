@@ -1,0 +1,22 @@
+# Compiles providers/*.json into provider_specs.hpp so the extension carries its provider list.
+# Adding or editing a provider file re-runs CMake on the next build.
+file(GLOB DECIDE_PROVIDER_FILES CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/providers/*.json")
+list(SORT DECIDE_PROVIDER_FILES)
+if(NOT DECIDE_PROVIDER_FILES)
+  message(FATAL_ERROR "decide: no provider files found in providers/")
+endif()
+set(DECIDE_SPECS "// Generated from providers/*.json by cmake_providers.cmake. Do not edit.\n#pragma once\n#include <string>\n#include <vector>\nnamespace decide {\nstatic const std::vector<std::string> PROVIDER_SPECS = {\n")
+foreach(DECIDE_FILE IN LISTS DECIDE_PROVIDER_FILES)
+  file(READ "${DECIDE_FILE}" DECIDE_CONTENT)
+  string(FIND "${DECIDE_CONTENT}" ")decide_json" DECIDE_BAD)
+  if(NOT DECIDE_BAD EQUAL -1)
+    message(FATAL_ERROR "decide: ${DECIDE_FILE} must not contain ')decide_json'")
+  endif()
+  string(APPEND DECIDE_SPECS "    R\"decide_json(${DECIDE_CONTENT})decide_json\",\n")
+endforeach()
+string(APPEND DECIDE_SPECS "};\n}\n")
+set(DECIDE_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/decide_generated")
+# Write through a temporary file so unchanged providers do not trigger a rebuild.
+file(WRITE "${DECIDE_GENERATED_DIR}/provider_specs.hpp.tmp" "${DECIDE_SPECS}")
+configure_file("${DECIDE_GENERATED_DIR}/provider_specs.hpp.tmp" "${DECIDE_GENERATED_DIR}/provider_specs.hpp" COPYONLY)
+include_directories("${DECIDE_GENERATED_DIR}")
