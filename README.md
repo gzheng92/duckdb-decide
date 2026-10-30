@@ -41,8 +41,8 @@ duckdb -unsigned
 
 ```sql
 LOAD 'build/release/extension/decide/decide.duckdb_extension';
-CREATE SECRET openai_decisions (TYPE decisions, API_KEY 'your-key');
--- Alternatively, export OPENAI_API_KEY before starting DuckDB.
+CREATE SECRET openai_key (TYPE decisions, API_KEY 'your-openai-key', SCOPE 'decisions://openai');
+-- Or export OPENAI_API_KEY before starting DuckDB. See "Setting API keys" for other providers.
 
 SELECT decision('A solar panel stores energy.', 'Does this mitigate climate change?');
 SELECT decision_prob('A solar panel stores energy.', 'Does this mitigate climate change?');
@@ -59,7 +59,7 @@ FROM patents p;
 ```
 
 Secrets are temporary by default, with API keys redacted from DuckDB's secret
-listing. The extension has no community distribution or signing yet.
+listing; see [Setting API keys](#setting-api-keys). The extension has no community distribution or signing yet.
 Community submission preparation and the draft descriptor are in
 [community/SUBMISSION.md](community/SUBMISSION.md). `INSTALL decide FROM community`
 will become available only after acceptance and publication.
@@ -75,25 +75,91 @@ will become available only after acceptance and publication.
 `SELECT * FROM decision_providers()` lists the providers built into your binary,
 with their formats, models, secret keys, and limits.
 
-```sql
-SET decisions_provider = 'jev';
-SET decisions_model = 'jev-1.14.0';   -- optional; empty uses the provider's default
-CREATE SECRET jev_key (TYPE decisions, API_KEY 'your-typesafe-key', SCOPE 'decisions://jev');
--- Alternatively export TYPESAFE_API_KEY before starting DuckDB.
-SELECT decision_prob('Checkout fails for every customer.', 'Is this urgent?');
+Pick a provider per session (or per query block), and optionally a model:
 
-SET decisions_provider = 'cloudflare';
-SET decisions_model = 'clef-flash';   -- or 'clef'
-CREATE SECRET cf_key (TYPE decisions, API_KEY 'workers-ai-token', ACCOUNT_ID 'your-account-id',
-                      SCOPE 'decisions://cloudflare');
--- Alternatively export CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID.
+```sql
+SET decisions_provider = 'jev';        -- 'openai' (default), 'jev', or 'cloudflare'
+SET decisions_model = 'jev-1.14.0';    -- optional; empty uses the provider's default
+SELECT decision_prob('Checkout fails for every customer.', 'Is this urgent?');
+RESET decisions_model;                 -- before switching to another provider
 ```
 
-**Keep keys per provider.** A secret without `SCOPE` is used for every provider,
-so switching `decisions_provider` would send that key to a different company.
-Scope each key with `SCOPE 'decisions://<provider>'`. A scoped secret takes
-precedence over an unscoped one. `decisions_model` applies to whichever provider
-is selected, so reset it (`RESET decisions_model`) when you switch.
+`decisions_model` applies to whichever provider is selected, so reset it when you
+switch.
+
+### Setting API keys
+
+Each provider looks for its key in this order:
+
+1. a `decisions` secret scoped to that provider (`SCOPE 'decisions://<provider>'`);
+2. a `decisions` secret with no scope;
+3. the provider's environment variable.
+
+**Scope every secret to its provider.** An unscoped secret is used for every
+provider, so switching `decisions_provider` would send that key to a different
+company. Keys are redacted in `duckdb_secrets()`, and the HTTP client never logs
+them.
+
+**OpenAI** uses an API key from the OpenAI platform.
+
+```sql
+CREATE SECRET openai_key (TYPE decisions, API_KEY 'sk-...', SCOPE 'decisions://openai');
+-- openai is the default provider; nothing else to set.
+```
+
+**TypeSafe Jev** uses an API key from the TypeSafe developer console.
+
+```sql
+CREATE SECRET jev_key (TYPE decisions, API_KEY 'your-typesafe-key', SCOPE 'decisions://jev');
+SET decisions_provider = 'jev';
+```
+
+**Cloudflare Clef** uses an API token that can call Workers AI, plus your account
+ID (shown in the Cloudflare dashboard).
+
+```sql
+CREATE SECRET cf_key (TYPE decisions, API_KEY 'your-workers-ai-token',
+                      ACCOUNT_ID 'your-account-id', SCOPE 'decisions://cloudflare');
+SET decisions_provider = 'cloudflare';
+```
+
+You can keep all three secrets at once and switch with `SET decisions_provider`.
+Each key is sent only to its own provider.
+
+**Environment variables** are used when no secret matches. Set them before
+starting DuckDB:
+
+```sh
+export OPENAI_API_KEY='sk-...'
+export TYPESAFE_API_KEY='your-typesafe-key'
+export CLOUDFLARE_API_TOKEN='your-workers-ai-token'
+export CLOUDFLARE_ACCOUNT_ID='your-account-id'
+duckdb -unsigned
+```
+
+**Saving a key across sessions:** secrets are temporary by default. `CREATE
+PERSISTENT SECRET` keeps one for later sessions. DuckDB stores it **unencrypted**
+under `~/.duckdb/stored_secrets/` (in a file only your user can read). Prefer
+environment variables or a secrets manager on shared machines. Run
+`LOAD decide` (or the `LOAD` path above) at the start of each session before
+using a stored secret.
+
+```sql
+CREATE PERSISTENT SECRET jev_key (TYPE decisions, API_KEY 'your-typesafe-key', SCOPE 'decisions://jev');
+DROP PERSISTENT SECRET jev_key;   -- to remove it
+```
+
+**Checking which key a provider will use:**
+
+```sql
+SELECT name, persistent, scope FROM duckdb_secrets() WHERE type = 'decisions';
+SELECT name FROM which_secret('decisions://jev', 'decisions');
+```
+
+If no secret matches and the environment variable is unset, queries fail with
+`Create a decisions secret or set <VARIABLE>`. If you add a provider of your own,
+it reads its key the same way, from the scope `decisions://<name>` and its
+`key_env` variable.
 
 Jev and Clef share the "System One" request format. Predicates become `noul`
 questions, choices `choice`, and scores `score` (a probability-weighted index
