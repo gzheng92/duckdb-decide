@@ -1,0 +1,9 @@
+{
+  "name": "jev",
+  "display_name": "TypeSafe Jev",
+  "format": "systemone",
+  "url": "https://api.typesafe.ai/v1/systemone",
+  "default_model": "jev-latest",
+  "key_env": "TYPESAFE_API_KEY",
+  "docs": "https://docs.typesafe.ai/api"
+}

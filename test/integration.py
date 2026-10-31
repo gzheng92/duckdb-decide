@@ -12,17 +12,19 @@ EXT = ROOT / 'build/release/extension/decide/decide.duckdb_extension'
 CLI = os.environ.get('DUCKDB_CLI') or shutil.which('duckdb') or str(ROOT / 'build/release/duckdb')
 requests = []
 clef_requests = []
+jev_requests = []
 attempts = 0
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
-    def do_clef(self):
-        assert self.headers['Authorization'] == 'Bearer cf-token'
+    def do_systemone(self, token, log, wrap):
+        """System One format, shared by Cloudflare Clef (wrapped in a REST envelope) and TypeSafe Jev."""
+        assert self.headers['Authorization'] == f'Bearer {token}', self.headers['Authorization']
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-        assert body['model'] in ('clef', 'clef-flash') and set(body) == {'model', 'state', 'questions'}
-        clef_requests.append(body)
+        assert set(body) == {'model', 'state', 'questions'}
+        log.append(body)
         state = body['state']
         if state == 'unauthorized':
             self.send_response(401); self.end_headers(); return
@@ -45,15 +47,19 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 assert isinstance(q['criteria'], list)
                 answers[name] = {'type': 'score', 'score': n % len(q['criteria']) if n is not None else 1.25, 'legend': {}, 'probabilities': {}, 'confidence': .5}
-        envelope = {'success': True, 'result': {'model': body['model'], 'answers': answers, 'usage': {'input_tokens': 1, 'output_tokens': 0}}}
+        reply = {'model': body['model'], 'answers': answers, 'usage': {'input_tokens': 1, 'output_tokens': 0}}
+        if state == 'extra-answer':
+            reply['answers']['surprise'] = {'type': 'noul', 'noul': .5}
         self.send_response(200); self.end_headers()
-        # Workers AI REST wraps output in a result envelope; the binding returns it bare.
-        self.wfile.write(json.dumps(envelope if state != 'bare' else envelope['result']).encode())
+        # Workers AI REST wraps output in a result envelope; its binding and Jev return it bare.
+        self.wfile.write(json.dumps({'success': True, 'result': reply} if wrap and state != 'bare' else reply).encode())
 
     def do_POST(self):
         global attempts
         if self.path == '/clef':
-            return self.do_clef()
+            return self.do_systemone('cf-token', clef_requests, wrap=True)
+        if self.path == '/v1/systemone':
+            return self.do_systemone('jev-key', jev_requests, wrap=False)
         assert self.path == '/v1/decisions'
         assert self.headers['Authorization'] == 'Bearer mock-key'
         body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
@@ -107,9 +113,16 @@ SET decisions_endpoint='http://127.0.0.1:{server.server_port}/clef';
 CREATE SECRET (TYPE decisions, API_KEY 'cf-token', ACCOUNT_ID 'abc123');
 """
 
-def run(sql, fail=None, prefix=setup):
+jev_setup = f"""LOAD '{EXT}';
+SET decisions_provider='jev';
+SET decisions_endpoint='http://127.0.0.1:{server.server_port}/v1/systemone';
+CREATE SECRET (TYPE decisions, API_KEY 'jev-key');
+"""
+
+def run(sql, fail=None, prefix=setup, env=None):
+    clean = {'OPENAI_API_KEY': '', 'CLOUDFLARE_API_TOKEN': '', 'CLOUDFLARE_ACCOUNT_ID': '', 'TYPESAFE_API_KEY': ''}
     p = subprocess.run([CLI, '-unsigned', '-json', '-c', prefix + sql], capture_output=True, text=True,
-                       env={**os.environ, 'OPENAI_API_KEY': '', 'CLOUDFLARE_API_TOKEN': '', 'CLOUDFLARE_ACCOUNT_ID': ''})
+                       env={**os.environ, **clean, **(env or {})})
     if fail:
         assert p.returncode and fail in p.stderr, (sql, p.stderr)
         assert 'INTERNAL Error' not in p.stderr, (sql, p.stderr)
@@ -228,10 +241,50 @@ try:
     cf("SET decisions_model='gpt'; SELECT decision_prob('x','Q')", fail='clef-flash')
     cf("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='cloudflare';", fail='CLOUDFLARE_API_TOKEN')
     cf("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='cloudflare'; CREATE SECRET (TYPE decisions, API_KEY 'k');", fail='account_id')
-    cf("SELECT decision_prob('x','Q')", prefix=clef_setup.replace('abc123', 'a/../b'), fail='Invalid Cloudflare account id')
-    cf("SET decisions_provider='other'; SELECT decision_prob('x','Q')", fail="'openai' or 'cloudflare'")
+    cf("SELECT decision_prob('x','Q')", prefix=clef_setup.replace('abc123', 'a/../b'), fail='Invalid account_id for Cloudflare Clef')
+    cf("SET decisions_provider='other'; SELECT decision_prob('x','Q')", fail="Unknown decisions_provider 'other'; available: cloudflare, jev, openai")
     secret = cf("SELECT secret_string FROM duckdb_secrets() WHERE type='decisions'")
     assert 'cf-token' not in secret[0]['secret_string']
+    # TypeSafe Jev: same System One format as Clef, from providers/jev.json alone
+    jev = lambda sql, **kw: run(sql, **{'prefix': jev_setup, **kw})
+    assert jev("SELECT decision('yes','Is it true?') AS v")[0]['v'] is True
+    assert jev("SELECT decision_prob('yes','Is it true?') AS v")[0]['v'] == .8
+    assert jev_requests[-1]['model'] == 'jev-latest' and jev_requests[-1]['questions']['decision']['type'] == 'noul'
+    assert jev("SELECT decision_choice('yes','Route?', ['billing','other']) AS v")[0]['v'] == 'billing'
+    assert jev_requests[-1]['questions']['decision']['criteria'] == {'billing': 'billing', 'other': 'other'}
+    assert jev("SELECT decision_score('yes','Severity?', ['low','medium','high']) AS v")[0]['v'] == 1.25
+    before = len(jev_requests)
+    rows = jev("SET decisions_batch_size=128; SELECT decision_prob('row ' || i,'Q') AS v FROM range(130) t(i)")
+    assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(130)]
+    assert [len(r['questions']) for r in jev_requests[before:]] == [128, 2]  # no provider cap, unlike Clef
+    jev("SET decisions_model='jev-1.14.0'; SELECT decision_prob('yes','Q') AS v")
+    assert jev_requests[-1]['model'] == 'jev-1.14.0'
+    spaced = json.dumps([{'type':'predicate','name':'has space','instructions':'Q'}])
+    assert json.loads(jev(f"SELECT decision_answers('x','{spaced}') AS v")[0]['v'])[0]['name'] == 'has space'
+    jev("SELECT decision_choice('unknown','Q',['a','b'])", fail='unknown choice')
+    proto = json.dumps([{'type':'predicate','name':'__proto__','instructions':'Q'}])
+    jev(f"SELECT decision_answers('x','{proto}')", fail="'__proto__' is reserved")
+    # Without a key nothing is sent; the error shows whether the endpoint itself was accepted.
+    no_key = f"LOAD '{EXT}'; SET decisions_endpoint='%s'; "
+    run("SELECT decision_prob('x','Q')", prefix=no_key % 'https://api.openai.com/v1/decisions', fail='set OPENAI_API_KEY')
+    run("SELECT decision_prob('x','Q')", prefix=no_key % 'https://evil.example/v1', fail='loopback mock server')
+    jev("SELECT decision_prob('extra-answer','Q')", fail='answer count mismatch')
+    jev("SELECT decision_prob('unauthorized','Q')", fail='TypeSafe Jev HTTP 401')
+    jev("SET decisions_model='../admin'; SELECT decision_prob('x','Q')", fail="Invalid decisions_model '../admin'")
+    jev("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='jev';", fail='TYPESAFE_API_KEY')
+    env_only = jev_setup.replace("CREATE SECRET (TYPE decisions, API_KEY 'jev-key');", '')
+    assert jev("SELECT decision_prob('yes','Q') AS v", prefix=env_only, env={'TYPESAFE_API_KEY': 'jev-key'})[0]['v'] == .8
+    # A secret scoped to one provider is used for it instead of the all-provider secret.
+    scoped = f"""LOAD '{EXT}';
+CREATE SECRET all_providers (TYPE decisions, API_KEY 'mock-key');
+CREATE SECRET only_jev (TYPE decisions, API_KEY 'jev-key', SCOPE 'decisions://jev');
+"""
+    assert run("SELECT decision_prob('yes','Q') AS v", prefix=scoped + setup.split('\n')[1] + '\n')[0]['v'] == .8
+    assert run("SELECT decision_prob('yes','Q') AS v", prefix=scoped + "SET decisions_provider='jev';\n" + jev_setup.split('\n')[2] + '\n')[0]['v'] == .8
+    providers = run("SELECT name, format, default_model, key_env, array_to_string(secret_keys, ',') AS secret_keys, max_questions::INTEGER AS max_questions FROM decision_providers() ORDER BY name")
+    assert [(p['name'], p['format'], p['default_model'], p['max_questions']) for p in providers] == [
+        ('cloudflare', 'systemone', 'clef', 64), ('jev', 'systemone', 'jev-latest', None), ('openai', 'openai', 'gpt-6-luna', None)]
+    assert providers[0]['secret_keys'] == 'api_key,account_id' and providers[1]['key_env'] == 'TYPESAFE_API_KEY'
     print('Passed SQL/HTTP integration checks, including batching, NULL mapping, chunk boundaries, payload splitting, and failures; no live API requests.')
 finally:
     server.shutdown()

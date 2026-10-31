@@ -102,3 +102,23 @@ instructions and is not a representative accuracy benchmark.
 - Release lines: this branch (`v2.x`) ships `0.2.*` for DuckDB 2.0. DuckDB 1.5.6
   stays on `v1.x` as `0.1.*`. The 2.0 artifact reports version `0.2.0`; official
   DuckDB 2.0.0 rejects 1.5.6 builds, so the lines need separate releases.
+
+## Provider factory — October 30, 2026
+
+- Providers moved from hard-coded C++ to JSON files in `providers/` (OpenAI,
+  Cloudflare Clef, and TypeSafe Jev). They are compiled into the extension and
+  turned into clients by a factory of wire formats: `openai`, and `systemone` for Jev
+  and Clef.
+- The Jev wire format was checked against TypeSafe's API reference
+  (docs.typesafe.ai/api): `POST https://api.typesafe.ai/v1/systemone`, Bearer key,
+  required `model` (`jev-latest`), name-keyed `questions` with `noul`, `choice`, and
+  `score`, and answers keyed by name with no wrapper or question cap. No live Jev
+  request was made; Jev coverage uses the loopback mock.
+- `make release`, `make test_release` (SQLLogicTest), the HTTP mock suite, and
+  `providers_test` passed on Linux x86_64 against DuckDB 2.0.0. The mock suite now
+  covers Jev (all functions, 128-question batches, model override, env key,
+  malformed responses, HTTP 401), per-provider secret scopes, `decision_providers()`,
+  and endpoint rejection. The artifact loaded in the official `duckdb==2.0.0` package.
+- Security review fixes: the endpoint is validated before any key is used; provider
+  names may not be prefixes of each other, because secret scopes match by prefix;
+  and model ids used in URLs reject `/` and `..`.
