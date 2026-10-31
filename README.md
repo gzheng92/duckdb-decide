@@ -6,6 +6,22 @@ the default), **TypeSafe Jev**, and **Cloudflare Clef**. Each provider is a smal
 JSON file in [`providers/`](providers/), so other hosts with a supported API format
 can be added without new code.
 
+## Install from community
+
+`decide` is available in the [DuckDB Community Extensions repository](https://duckdb.org/community_extensions/extensions/decide)
+for DuckDB **2.0.0** on supported platforms:
+
+```sql
+INSTALL decide FROM community;
+LOAD decide;
+```
+
+Community builds are signed and load in the normal DuckDB CLI. Configure your
+provider credentials before evaluating rows; see [Setting API keys](#setting-api-keys).
+The current community build is extension version 0.2.0 (OpenAI and Cloudflare Clef).
+TypeSafe Jev, provider files, and `decision_providers()` arrive in the community
+build with the next release; until then, build from source to use them.
+
 ## DuckDB compatibility
 
 DuckDB loads an extension only into the DuckDB version it was built for, so each
@@ -23,7 +39,7 @@ Apple Silicon, and Windows (x86_64). Intel Macs and DuckDB-Wasm are not supporte
 Fixes land on both lines while 1.5.x is supported.
 See [RELEASING.md](RELEASING.md).
 
-## Build and load
+## Build from source
 
 Requires Git, CMake, a C++17 compiler, libcurl development headers, Python 3 for
 mock tests, and DuckDB **2.0.0** (LTS). On an Apple Silicon Mac, Homebrew's tools are
@@ -59,10 +75,10 @@ FROM patents p;
 ```
 
 Secrets are temporary by default, with API keys redacted from DuckDB's secret
-listing; see [Setting API keys](#setting-api-keys). The extension has no community distribution or signing yet.
-Community submission preparation and the draft descriptor are in
-[community/SUBMISSION.md](community/SUBMISSION.md). `INSTALL decide FROM community`
-will become available only after acceptance and publication.
+listing; see [Setting API keys](#setting-api-keys). The `-unsigned` flag above is
+for local build artifacts; community installation does not require it. The accepted
+submission and maintenance procedure are documented in
+[community/SUBMISSION.md](community/SUBMISSION.md).
 
 ## Providers
 
@@ -94,6 +110,12 @@ Each provider looks for its key in this order:
 1. a `decisions` secret scoped to that provider (`SCOPE 'decisions://<provider>'`);
 2. a `decisions` secret with no scope;
 3. the provider's environment variable.
+
+> **Version note:** per-provider scopes need a build newer than 0.2.0. The current
+> community build (0.2.0) and the 1.x line only look for secrets without a scope.
+> On those versions, omit `SCOPE` (for example `CREATE SECRET openai_key (TYPE
+> decisions, API_KEY 'sk-...')`) or use the environment variables below. Those
+> versions support only OpenAI and Cloudflare Clef.
 
 **Scope every secret to its provider.** An unscoped secret is used for every
 provider, so switching `decisions_provider` would send that key to a different
