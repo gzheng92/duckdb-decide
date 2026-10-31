@@ -18,9 +18,10 @@ LOAD decide;
 
 Community builds are signed and load in the normal DuckDB CLI. Configure your
 provider credentials before evaluating rows; see [Setting API keys](#setting-api-keys).
-The current community build is extension version 0.2.0 (OpenAI and Cloudflare Clef).
-TypeSafe Jev, provider files, and `decision_providers()` arrive in the community
-build with the next release; until then, build from source to use them.
+TypeSafe Jev, provider files, `decision_providers()`, and per-provider secret
+scopes need extension 0.2.1 or later. Check your installed version with
+`SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'decide';`
+and run `UPDATE EXTENSIONS (decide);` to pick up the latest community build.
 
 ## DuckDB compatibility
 
@@ -57,7 +58,7 @@ duckdb -unsigned
 
 ```sql
 LOAD 'build/release/extension/decide/decide.duckdb_extension';
-CREATE SECRET openai_key (TYPE decisions, API_KEY 'your-openai-key', SCOPE 'decisions://openai');
+CREATE OR REPLACE SECRET openai_key (TYPE decisions, API_KEY 'your-openai-key', SCOPE 'decisions://openai');
 -- Or export OPENAI_API_KEY before starting DuckDB. See "Setting API keys" for other providers.
 
 SELECT decision('A solar panel stores energy.', 'Does this mitigate climate change?');
@@ -111,11 +112,11 @@ Each provider looks for its key in this order:
 2. a `decisions` secret with no scope;
 3. the provider's environment variable.
 
-> **Version note:** per-provider scopes need a build newer than 0.2.0. The current
-> community build (0.2.0) and the 1.x line only look for secrets without a scope.
-> On those versions, omit `SCOPE` (for example `CREATE SECRET openai_key (TYPE
-> decisions, API_KEY 'sk-...')`) or use the environment variables below. Those
-> versions support only OpenAI and Cloudflare Clef.
+> **Version note:** per-provider scopes need extension 0.2.1 or later. Version
+> 0.2.0 and the 1.x line only look for secrets without a scope. On those versions,
+> omit `SCOPE` (for example `CREATE OR REPLACE SECRET openai_key (TYPE decisions, API_KEY
+> 'sk-...')`) or use the environment variables below. Those versions support only
+> OpenAI and Cloudflare Clef.
 
 **Scope every secret to its provider.** An unscoped secret is used for every
 provider, so switching `decisions_provider` would send that key to a different
@@ -125,14 +126,14 @@ them.
 **OpenAI** uses an API key from the OpenAI platform.
 
 ```sql
-CREATE SECRET openai_key (TYPE decisions, API_KEY 'sk-...', SCOPE 'decisions://openai');
+CREATE OR REPLACE SECRET openai_key (TYPE decisions, API_KEY 'sk-...', SCOPE 'decisions://openai');
 -- openai is the default provider; nothing else to set.
 ```
 
 **TypeSafe Jev** uses an API key from the TypeSafe developer console.
 
 ```sql
-CREATE SECRET jev_key (TYPE decisions, API_KEY 'your-typesafe-key', SCOPE 'decisions://jev');
+CREATE OR REPLACE SECRET jev_key (TYPE decisions, API_KEY 'your-typesafe-key', SCOPE 'decisions://jev');
 SET decisions_provider = 'jev';
 ```
 
@@ -140,7 +141,7 @@ SET decisions_provider = 'jev';
 ID (shown in the Cloudflare dashboard).
 
 ```sql
-CREATE SECRET cf_key (TYPE decisions, API_KEY 'your-workers-ai-token',
+CREATE OR REPLACE SECRET cf_key (TYPE decisions, API_KEY 'your-workers-ai-token',
                       ACCOUNT_ID 'your-account-id', SCOPE 'decisions://cloudflare');
 SET decisions_provider = 'cloudflare';
 ```
