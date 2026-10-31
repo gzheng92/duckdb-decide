@@ -1,0 +1,9 @@
+{
+  "name": "openai",
+  "display_name": "OpenAI Decisions",
+  "format": "openai",
+  "url": "https://api.openai.com/v1/decisions",
+  "default_model": "gpt-6-luna",
+  "models": ["gpt-6-luna"],
+  "key_env": "OPENAI_API_KEY"
+}

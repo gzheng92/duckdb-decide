@@ -37,3 +37,10 @@ packages from public mirrors. When a mirror is down, the build fails before any 
 this repository's code compiles. The `Retry infrastructure failures` workflow re-runs
 the failed jobs once when the failure log shows such an outage. Any other failure,
 or a second failure, still needs a look.
+
+Providers are JSON files in `providers/`, compiled into the extension. Adding a host
+that speaks an existing wire format needs only a new file; see
+[providers/README.md](providers/README.md). Run `test/providers_test.cpp` against
+`providers/*.json` (CI does) and add mock coverage in `test/integration.py` when a
+host differs from existing providers in more than its URL, model, and key. Confirm
+formats against the host's API reference, and never add live calls to the tests.

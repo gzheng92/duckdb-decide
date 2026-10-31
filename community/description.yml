@@ -1,6 +1,6 @@
 extension:
   name: decide
-  description: Filter, classify, and score text using OpenAI Decisions from SQL
+  description: Filter, classify, and score text from SQL with OpenAI Decisions, TypeSafe Jev, or Cloudflare Clef
   version: 0.2.0
   language: C++
   build: cmake
@@ -25,9 +25,12 @@ docs:
     Typed functions batch 20 rows per request by default; set
     `decisions_batch_size = 1` for independent row evaluation.
     Non-NULL inputs and instructions are sent to OpenAI and can incur API charges.
-    Credentials use DuckDB's `decisions` secret type or `OPENAI_API_KEY`.
+    Providers: OpenAI Decisions (default), TypeSafe Jev, and Cloudflare Clef,
+    selected with `SET decisions_provider`; `decision_providers()` lists them.
+    Credentials use DuckDB's `decisions` secret type (scope keys per provider with
+    `SCOPE 'decisions://<provider>'`) or each provider's environment variable.
     No API key is required to build or run the offline tests.
-    The integration currently accepts text only and targets `gpt-6-luna`.
+    The integration currently accepts text only.
     This is an independent integration with an upstream API in public beta.
     See the [README](https://github.com/gzheng92/duckdb-decide#readme)
     for function signatures, limits, refusal handling, and batching semantics.

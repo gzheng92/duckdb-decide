@@ -57,6 +57,24 @@ Invalid Input Error: Decisions: decisions_batch_size must be between 1 and 128
 statement ok
 SET decisions_batch_size = 20;
 
+query III
+SELECT name, format, default_model FROM decision_providers() ORDER BY name;
+----
+cloudflare	systemone	clef
+jev	systemone	jev-latest
+openai	openai	gpt-6-luna
+
+statement ok
+SET decisions_provider = 'nonexistent';
+
+statement error
+SELECT decision_prob('x', 'Q');
+----
+Invalid Input Error: Decisions: Unknown decisions_provider 'nonexistent'; available: cloudflare, jev, openai
+
+statement ok
+RESET decisions_provider;
+
 statement ok
 SET enable_external_access = false;
 
@@ -64,3 +82,4 @@ statement error
 SELECT decision_prob('x', 'Q');
 ----
 Permission Error: Decisions requires external access
+
