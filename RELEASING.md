@@ -35,8 +35,8 @@ DuckDB submodule, `.gitmodules`, or workflow pins disagree with that file.
 
    The workflow checks that the version belongs to the branch and isn't already
    released. It then builds and tests every supported platform for that DuckDB
-   version and publishes a GitHub Release with one binary per platform and a
-   `SHA256SUMS` file. Releases from `v1.x` are not marked as the repository's
+   version and publishes a GitHub Release with one zip per platform (each holding
+   `decide.duckdb_extension`) and a `SHA256SUMS` file. Releases from `v1.x` are not marked as the repository's
    latest release.
 
 ## Starting a new DuckDB line

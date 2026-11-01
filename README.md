@@ -40,6 +40,13 @@ Apple Silicon, and Windows (x86_64). Intel Macs and DuckDB-Wasm are not supporte
 Fixes land on both lines while 1.5.x is supported.
 See [RELEASING.md](RELEASING.md).
 
+Each release has one zip per platform, holding `decide.duckdb_extension`. Keep that
+file name when you `LOAD` it: DuckDB derives the extension's entry point from the
+file name, so a renamed file fails with "did not contain the expected entrypoint".
+Releases `v0.1.1`, `v0.2.0`, and `v0.2.1` attach bare binaries named like
+`decide-v0.2.1-duckdb-v2.0.0-linux_amd64.duckdb_extension`. Rename the download to
+`decide.duckdb_extension` before loading it.
+
 ## Build from source
 
 Requires Git, CMake, a C++17 compiler, libcurl development headers, Python 3 for
