@@ -65,13 +65,18 @@ jobs:
           pattern: decide-${{ needs.check.outputs.duckdb_version }}-extension-*
       - name: Collect binaries
         run: |
-          mkdir dist
+          # DuckDB derives an extension's entry point from its file name, so the binary
+          # must stay decide.duckdb_extension. Each platform ships as a zip holding it.
+          mkdir dist staging
           prefix="decide-$DUCKDB_VERSION-extension-"
           for dir in artifacts/"$prefix"*; do
             platform=${dir#artifacts/$prefix}
             files=$(find "$dir" -name '*.duckdb_extension')
             [ "$(echo "$files" | grep -c .)" = 1 ] || { echo "expected one binary in $dir" >&2; exit 1; }
-            cp "$files" "dist/decide-$TAG-duckdb-$DUCKDB_VERSION-$platform.duckdb_extension"
+            package="decide-$TAG-duckdb-$DUCKDB_VERSION-$platform"
+            mkdir "staging/$package"
+            cp "$files" "staging/$package/decide.duckdb_extension"
+            (cd "staging/$package" && zip -q -X "../../dist/$package.zip" decide.duckdb_extension)
           done
           ls dist | grep -q . || { echo "no binaries were built" >&2; exit 1; }
           (cd dist && sha256sum * > SHA256SUMS)
@@ -83,11 +88,13 @@ jobs:
           version it was built for. For another DuckDB release, use the matching line in the
           [compatibility table](https://github.com/$GITHUB_REPOSITORY#duckdb-compatibility).
 
-          Download the binary for your platform, then:
+          Download the zip for your platform and unzip it. It contains
+          \`decide.duckdb_extension\`. Keep that file name: DuckDB derives the extension's
+          entry point from it, so a renamed file fails to load.
 
           \`\`\`sql
           -- start DuckDB with -unsigned (CLI) or allow_unsigned_extensions=true
-          LOAD 'path/to/decide-$TAG-duckdb-$DUCKDB_VERSION-<platform>.duckdb_extension';
+          LOAD 'path/to/decide.duckdb_extension';
           \`\`\`
 
           Verify downloads with \`SHA256SUMS\`.
