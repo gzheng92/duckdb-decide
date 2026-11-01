@@ -122,3 +122,17 @@ instructions and is not a representative accuracy benchmark.
 - Security review fixes: the endpoint is validated before any key is used; provider
   names may not be prefixes of each other, because secret scopes match by prefix;
   and model ids used in URLs reject `/` and `..`.
+
+## Release 0.2.1 preparation — October 31, 2026
+
+- Bumped the extension to 0.2.1 (`extension_config.cmake`, `community/description.yml`).
+  The built artifact reports `0.2.1` in `duckdb_extensions()`, and the HTTP mock
+  suite passed.
+- The community descriptor now documents TypeSafe Jev, `decision_providers()`, and
+  per-provider secret scopes. `repo.ref` still pins the 0.2.0 source; it moves to
+  the v0.2.1 release commit before the upstream submission.
+- Every SQL snippet in the descriptor and the README's provider and key sections
+  was run in order against the built extension, with network calls replaced by
+  `EXPLAIN`. Examples now use `CREATE OR REPLACE SECRET` because the hello-world
+  and credentials examples both create `openai_key`. `UPDATE EXTENSIONS (decide)`
+  parses in DuckDB 2.0.0.
