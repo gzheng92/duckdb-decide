@@ -10,8 +10,8 @@ extension:
     - gzheng92
 repo:
   github: gzheng92/duckdb-decide
-  # Validated DuckDB 2.0.0 source revision. Set to the v0.2.1 release commit before submitting.
-  ref: 96a0e33fa9b52210af63c2f08bd21024bd2ae0ab
+  # Validated DuckDB 2.0.0 source revision: the v0.2.1 release commit.
+  ref: a520e4b0a4aa9e7a1ed20e8fd825108f7e6ecd3a
 docs:
   hello_world: |
     -- OpenAI example; use your own API key.
