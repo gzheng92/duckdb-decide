@@ -122,7 +122,10 @@ each DuckDB chunk, rows with identical questions and options are grouped. Each
 request contains a JSON array of records, with one uniquely named question that
 explicitly targets each record. Results are checked for matching names, types,
 and counts before they are assigned back to SQL rows. NULL rows are skipped.
-Large batches are split to stay within the 16 MiB request limit.
+Rows with the same input, question, and options are sent once per chunk, and
+every copy gets that answer (each `decision` row still applies its own
+threshold), so repeated values cost one evaluation per chunk. Large batches are
+split to stay within the 16 MiB request limit.
 
 ```sql
 SET decisions_batch_size = 20; -- allowed extension range: 1 through 128
@@ -133,11 +136,15 @@ Batching shares evidence across records, so compare results against batch size 1
 on representative labeled data before choosing a larger batch. This is an
 extension technique using multiple API questions, not a native multi-input API.
 `decision_answers` preserves user-defined question names and makes one request
-per row; its explicit questions already share that row's input.
+per distinct row (identical input and questions in a chunk share one request);
+its explicit questions already share that row's input.
 
-Requests execute sequentially within each chunk. There is no persistent cache or
-extension-managed concurrency pool. Functions are marked volatile to prevent the
-SQL optimizer from precomputing network calls. Repeating calls can incur repeated
+Requests execute sequentially within each chunk. Deduplication applies only
+within a chunk (about 2,048 rows); there is no persistent cache across chunks or
+queries, and no extension-managed concurrency pool. To evaluate each value exactly
+once across a whole table, run the function over `SELECT DISTINCT` and join back.
+Functions are marked volatile to prevent the SQL optimizer from precomputing
+network calls. Repeating calls can incur repeated
 charges, so materialize results you plan to reuse.
 
 Requests time out after 30 seconds (10-second connection timeout). HTTP 429 is

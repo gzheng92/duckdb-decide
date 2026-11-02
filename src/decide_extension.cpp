@@ -39,6 +39,7 @@ struct PendingRow {
     string input;
     Json questions;
     double threshold;
+    vector<PendingRow *> copies; // later rows in the chunk with the same input and question
 };
 struct PendingBatch {
     vector<PendingRow *> rows;
@@ -116,7 +117,14 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         auto config = Configuration(state.GetContext());
         if (MODE == Mode::Answers) {
             // Preserve user-defined names and shared-input semantics for explicit questions.
-            for (const auto &row : pending) result.SetValue(row.row, Value(decide::Evaluate(config, row.input, row.questions).dump()));
+            // Identical (input, questions) rows in the chunk are evaluated once.
+            std::map<std::pair<string, string>, string> answered;
+            for (const auto &row : pending) {
+                auto key = std::make_pair(row.input, row.questions.dump());
+                auto it = answered.find(key);
+                if (it == answered.end()) it = answered.emplace(key, decide::Evaluate(config, row.input, row.questions).dump()).first;
+                result.SetValue(row.row, Value(it->second));
+            }
             return;
         }
         Value setting;
@@ -124,8 +132,16 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         auto batch_size = setting.GetValue<uint64_t>();
         if (batch_size < 1 || batch_size > 128) throw std::runtime_error("decisions_batch_size must be between 1 and 128");
         if (config.Cloudflare()) batch_size = MinValue<uint64_t>(batch_size, decide::CLOUDFLARE_MAX_QUESTIONS);
+        // Group rows by question, and send each distinct input once per group; repeats
+        // receive the same answer (each still applies its own threshold).
         std::map<string, vector<PendingRow *>> groups;
-        for (auto &row : pending) groups[row.questions.dump()].push_back(&row);
+        std::map<std::pair<string, string>, PendingRow *> first;
+        for (auto &row : pending) {
+            auto question = row.questions.dump();
+            auto inserted = first.emplace(std::make_pair(row.input, question), &row);
+            if (inserted.second) groups[question].push_back(&row);
+            else inserted.first->second->copies.push_back(&row);
+        }
         vector<PendingBatch> batches;
         for (const auto &entry : groups) {
             const auto &rows = entry.second;
@@ -137,13 +153,16 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         for (const auto &batch : batches) {
             auto answers = decide::Evaluate(config, batch.input, batch.questions);
             for (idx_t i = 0; i < batch.rows.size(); ++i) {
-                const auto &row = *batch.rows[i];
                 const auto &answer = answers[i];
                 if (answer["type"] == "refusal") throw std::runtime_error(std::string(config.Name()) + " refused this decision");
-                if (MODE == Mode::Predicate) result.SetValue(row.row, Value(answer["probability"].get<double>() >= row.threshold));
-                if (MODE == Mode::Probability) result.SetValue(row.row, Value(answer["probability"].get<double>()));
-                if (MODE == Mode::Choice) result.SetValue(row.row, Value(answer["choice"].get<string>()));
-                if (MODE == Mode::Score) result.SetValue(row.row, Value(answer["score"].get<double>()));
+                auto assign = [&](const PendingRow &row) {
+                    if (MODE == Mode::Predicate) result.SetValue(row.row, Value(answer["probability"].get<double>() >= row.threshold));
+                    if (MODE == Mode::Probability) result.SetValue(row.row, Value(answer["probability"].get<double>()));
+                    if (MODE == Mode::Choice) result.SetValue(row.row, Value(answer["choice"].get<string>()));
+                    if (MODE == Mode::Score) result.SetValue(row.row, Value(answer["score"].get<double>()));
+                };
+                assign(*batch.rows[i]);
+                for (const auto *copy : batch.rows[i]->copies) assign(*copy);
             }
         }
     } catch (const Exception &) { throw; // Keep DuckDB's own error types, e.g. permission errors.
