@@ -8,8 +8,12 @@
 #include "duckdb/function/table_function.hpp"
 #include "client.hpp"
 #include "provider_specs.hpp" // generated from providers/*.json at configure time
+#include <atomic>
 #include <cstdlib>
+#include <exception>
 #include <map>
+#include <mutex>
+#include <thread>
 namespace duckdb {
 using decide::Json;
 // Built once from the provider files compiled into the extension; they are checked at load time.
@@ -93,6 +97,53 @@ static void PlanBatch(const decide::Config &config, const vector<PendingRow *> &
     }
     batches.push_back(std::move(batch));
 }
+struct Request {
+    const string *input;
+    const Json *questions;
+};
+// Sends a chunk's requests, up to decisions_concurrency at a time, and returns the answers in
+// request order. The first failure, or an interrupt, stops new requests and aborts the ones in
+// flight; that first error is the one reported.
+static vector<Json> EvaluateAll(ClientContext &context, const decide::Config &config, const vector<Request> &requests) {
+    Value setting;
+    context.TryGetCurrentSetting("decisions_concurrency", setting);
+    auto limit = setting.GetValue<uint64_t>();
+    if (limit < 1 || limit > 32) throw std::runtime_error("decisions_concurrency must be between 1 and 32");
+    decide::InitHttp();
+    vector<Json> answers(requests.size());
+    std::atomic<bool> failed(false);
+    std::atomic<idx_t> next(0);
+    std::exception_ptr error;
+    std::mutex error_lock;
+    decide::Cancelled cancelled = [&]() { return failed.load() || context.IsInterrupted(); };
+    auto work = [&]() {
+        for (idx_t i; !cancelled() && (i = next++) < requests.size();) {
+            try {
+                answers[i] = decide::Evaluate(config, *requests[i].input, *requests[i].questions, cancelled);
+            } catch (...) {
+                std::lock_guard<std::mutex> guard(error_lock);
+                if (!error) error = std::current_exception(); // record before signalling the others
+                failed = true;
+                return;
+            }
+        }
+    };
+    auto workers = MinValue<idx_t>(limit, requests.size());
+    if (workers <= 1) work();
+    else {
+        vector<std::thread> threads;
+        threads.reserve(workers - 1);
+        try {
+            for (idx_t i = 1; i < workers; ++i) threads.emplace_back(work);
+        } catch (...) { failed = true; } // could not start a thread: stop, then report below
+        work();
+        for (auto &thread : threads) thread.join();
+        if (!error && failed) throw std::runtime_error("Could not start request threads");
+    }
+    if (context.IsInterrupted()) throw InterruptException();
+    if (error) std::rethrow_exception(error);
+    return answers;
+}
 template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
     result.SetVectorType(VectorType::FLAT_VECTOR);
     try {
@@ -134,13 +185,16 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         if (MODE == Mode::Answers) {
             // Preserve user-defined names and shared-input semantics for explicit questions.
             // Identical (input, questions) rows in the chunk are evaluated once.
-            std::map<std::pair<string, string>, string> answered;
+            std::map<std::pair<string, string>, idx_t> index;
+            vector<Request> requests;
+            vector<idx_t> slot;
             for (const auto &row : pending) {
-                auto key = std::make_pair(row.input, row.questions.dump());
-                auto it = answered.find(key);
-                if (it == answered.end()) it = answered.emplace(key, decide::Evaluate(config, row.input, row.questions).dump()).first;
-                result.SetValue(row.row, Value(it->second));
+                auto inserted = index.emplace(std::make_pair(row.input, row.questions.dump()), requests.size());
+                if (inserted.second) requests.push_back({&row.input, &row.questions});
+                slot.push_back(inserted.first->second);
             }
+            auto answers = EvaluateAll(state.GetContext(), config, requests);
+            for (idx_t i = 0; i < pending.size(); ++i) result.SetValue(pending[i].row, Value(answers[slot[i]].dump()));
             return;
         }
         Value setting;
@@ -166,8 +220,12 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
                 PlanBatch(config, vector<PendingRow *>(rows.begin() + start, rows.begin() + end), batches);
             }
         }
-        for (const auto &batch : batches) {
-            auto answers = decide::Evaluate(config, batch.input, batch.questions);
+        vector<Request> requests;
+        for (const auto &batch : batches) requests.push_back({&batch.input, &batch.questions});
+        auto responses = EvaluateAll(state.GetContext(), config, requests);
+        for (idx_t b = 0; b < batches.size(); ++b) {
+            const auto &batch = batches[b];
+            const auto &answers = responses[b];
             for (idx_t i = 0; i < batch.rows.size(); ++i) {
                 const auto &answer = answers[i];
                 if (answer["type"] == "refusal") throw std::runtime_error(config.Name() + " refused this decision");
@@ -235,6 +293,7 @@ static void LoadInternal(ExtensionLoader &loader) {
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_endpoint", "Empty for the provider's URL; a loopback http://127.0.0.1 URL for mock tests", LogicalType::VARCHAR, Value(""));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_provider", "Decision provider: " + providers.Names() + "; see decision_providers()", LogicalType::VARCHAR, Value("openai"));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_model", "Model id; empty for the provider's default_model", LogicalType::VARCHAR, Value(""));
+    DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_concurrency", "Requests in flight at once per chunk (1 to 32); 1 sends them one at a time", LogicalType::UBIGINT, Value::UBIGINT(4));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_batch_size", "Rows per request for typed functions (1 to 128)", LogicalType::UBIGINT, Value::UBIGINT(20));
     auto make = [](const char *name, vector<LogicalType> args, LogicalType output, scalar_function_t fun) {
         ScalarFunction function(name, std::move(args), std::move(output), fun);
