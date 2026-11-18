@@ -24,6 +24,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client aborted the request, e.g. after another one failed
+
     def do_systemone(self, token, log, wrap):
         """System One format, shared by Cloudflare Clef (wrapped in a REST envelope) and TypeSafe Jev."""
         assert self.headers['Authorization'] == f'Bearer {token}', self.headers['Authorization']
