@@ -51,7 +51,49 @@ static decide::Config Configuration(ClientContext &context) {
     }
     return config;
 }
-enum class Mode { Predicate, Probability, Choice, Score, Answers };
+enum class Mode { Predicate, Probability, Choice, Score, Answers, ChoiceDetail, ScoreDetail };
+// Result types of decision_choice_detail and decision_score_detail.
+static LogicalType DetailType(bool choice) {
+    child_list_t<LogicalType> fields;
+    fields.emplace_back(Identifier(choice ? "choice" : "score"), choice ? LogicalType::VARCHAR : LogicalType::DOUBLE);
+    fields.emplace_back(Identifier("confidence"), LogicalType::DOUBLE);
+    fields.emplace_back(Identifier("probabilities"), LogicalType::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE));
+    fields.emplace_back(Identifier("model"), LogicalType::VARCHAR);
+    return LogicalType::STRUCT(std::move(fields));
+}
+// The answer with its confidence and its probability for each option (scores are keyed by
+// level label, in level order), plus the model that answered. Missing fields are NULL.
+static Value DetailValue(bool choice, const Json &question, const Json &answer, const string &model) {
+    vector<string> keys;
+    vector<Value> labels;
+    if (choice) {
+        for (const auto &option : question["choices"]) {
+            keys.push_back(option["value"].get<string>());
+            labels.emplace_back(keys.back());
+        }
+    } else {
+        for (const auto &level : question["levels"]) {
+            keys.push_back(std::to_string(keys.size()));
+            labels.emplace_back(level["label"].get<string>());
+        }
+    }
+    auto distribution = decide::Distribution(answer, keys);
+    auto confidence = decide::Confidence(answer);
+    auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE);
+    Value probabilities(map_type);
+    if (!distribution.is_null()) {
+        vector<Value> values;
+        for (const auto &v : distribution) values.emplace_back(Value::DOUBLE(v.get<double>()));
+        probabilities = Value::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE, std::move(labels), std::move(values));
+    }
+    child_list_t<Value> fields;
+    fields.emplace_back(Identifier(choice ? "choice" : "score"),
+                        choice ? Value(answer["choice"].get<string>()) : Value::DOUBLE(answer["score"].get<double>()));
+    fields.emplace_back(Identifier("confidence"), confidence.is_null() ? Value(LogicalType::DOUBLE) : Value::DOUBLE(confidence.get<double>()));
+    fields.emplace_back(Identifier("probabilities"), std::move(probabilities));
+    fields.emplace_back(Identifier("model"), Value(model));
+    return Value::STRUCT(std::move(fields));
+}
 struct PendingRow {
     idx_t row;
     string input;
@@ -104,13 +146,15 @@ struct Request {
 // Sends a chunk's requests, up to decisions_concurrency at a time, and returns the answers in
 // request order. The first failure, or an interrupt, stops new requests and aborts the ones in
 // flight; that first error is the one reported.
-static vector<Json> EvaluateAll(ClientContext &context, const decide::Config &config, const vector<Request> &requests) {
+static vector<Json> EvaluateAll(ClientContext &context, const decide::Config &config, const vector<Request> &requests,
+                                vector<string> *models = nullptr) {
     Value setting;
     context.TryGetCurrentSetting("decisions_concurrency", setting);
     auto limit = setting.GetValue<uint64_t>();
     if (limit < 1 || limit > 32) throw std::runtime_error("decisions_concurrency must be between 1 and 32");
     decide::InitHttp();
     vector<Json> answers(requests.size());
+    if (models) models->assign(requests.size(), string());
     std::atomic<bool> failed(false);
     std::atomic<idx_t> next(0);
     std::exception_ptr error;
@@ -119,7 +163,7 @@ static vector<Json> EvaluateAll(ClientContext &context, const decide::Config &co
     auto work = [&]() {
         for (idx_t i; !cancelled() && (i = next++) < requests.size();) {
             try {
-                answers[i] = decide::Evaluate(config, *requests[i].input, *requests[i].questions, cancelled);
+                answers[i] = decide::Evaluate(config, *requests[i].input, *requests[i].questions, cancelled, models ? &(*models)[i] : nullptr);
             } catch (...) {
                 std::lock_guard<std::mutex> guard(error_lock);
                 if (!error) error = std::current_exception(); // record before signalling the others
@@ -160,7 +204,7 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
             if (MODE == Mode::Answers) questions = Json::parse(instructions);
             else {
                 Json labels = nullptr;
-                if (MODE == Mode::Choice || MODE == Mode::Score) {
+                if (MODE == Mode::Choice || MODE == Mode::Score || MODE == Mode::ChoiceDetail || MODE == Mode::ScoreDetail) {
                     labels = Json::array();
                     auto list = args.data[2].GetValue(row);
                     for (const auto &label : ListValue::GetChildren(list)) {
@@ -168,7 +212,8 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
                         labels.push_back(label.ToString());
                     }
                 }
-                auto type = MODE == Mode::Choice ? "choice" : MODE == Mode::Score ? "score" : "predicate";
+                auto type = MODE == Mode::Choice || MODE == Mode::ChoiceDetail ? "choice"
+                            : MODE == Mode::Score || MODE == Mode::ScoreDetail ? "score" : "predicate";
                 questions = Json::array({decide::Question(type, instructions, labels)});
             }
             double threshold = 0.5;
@@ -222,7 +267,8 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         }
         vector<Request> requests;
         for (const auto &batch : batches) requests.push_back({&batch.input, &batch.questions});
-        auto responses = EvaluateAll(state.GetContext(), config, requests);
+        vector<string> models;
+        auto responses = EvaluateAll(state.GetContext(), config, requests, &models);
         for (idx_t b = 0; b < batches.size(); ++b) {
             const auto &batch = batches[b];
             const auto &answers = responses[b];
@@ -234,6 +280,8 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
                     if (MODE == Mode::Probability) result.SetValue(row.row, Value(answer["probability"].get<double>()));
                     if (MODE == Mode::Choice) result.SetValue(row.row, Value(answer["choice"].get<string>()));
                     if (MODE == Mode::Score) result.SetValue(row.row, Value(answer["score"].get<double>()));
+                    if (MODE == Mode::ChoiceDetail || MODE == Mode::ScoreDetail)
+                        result.SetValue(row.row, DetailValue(MODE == Mode::ChoiceDetail, row.questions[0], answer, models[b]));
                 };
                 assign(*batch.rows[i]);
                 for (const auto *copy : batch.rows[i]->copies) assign(*copy);
@@ -310,6 +358,8 @@ static void LoadInternal(ExtensionLoader &loader) {
     add("decision_prob", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::DOUBLE, Execute<Mode::Probability>);
     add("decision_choice", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, LogicalType::VARCHAR, Execute<Mode::Choice>);
     add("decision_score", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, LogicalType::DOUBLE, Execute<Mode::Score>);
+    add("decision_choice_detail", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, DetailType(true), Execute<Mode::ChoiceDetail>);
+    add("decision_score_detail", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, DetailType(false), Execute<Mode::ScoreDetail>);
     add("decision_answers", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::VARCHAR, Execute<Mode::Answers>);
     loader.RegisterFunction(TableFunction("decision_providers", {}, ProvidersScan, ProvidersBind, ProvidersInit));
 }

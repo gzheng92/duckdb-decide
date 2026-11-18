@@ -115,7 +115,9 @@ public:
             }
             answers.push_back(std::move(a));
         }
-        return {{"answers", answers}};
+        Json out = {{"answers", answers}};
+        if (body->contains("model")) out["model"] = (*body)["model"];
+        return out;
     }
 
 private:

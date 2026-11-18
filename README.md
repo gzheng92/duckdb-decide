@@ -233,12 +233,44 @@ small C++ class registered in `WireFormats()` in `src/include/providers.hpp`.
 | `decision_prob(input, question)` | DOUBLE, probability the condition is true |
 | `decision_choice(input, question, labels)` | VARCHAR, one supplied label |
 | `decision_score(input, question, ordered_labels)` | DOUBLE, weighted level index starting at 0 |
+| `decision_choice_detail(input, question, labels)` | STRUCT(choice, confidence, probabilities, model) |
+| `decision_score_detail(input, question, ordered_labels)` | STRUCT(score, confidence, probabilities, model) |
 | `decision_answers(input, questions_json)` | VARCHAR containing the answers JSON array |
 
 Any top-level NULL argument produces SQL NULL without making a request. Empty,
 duplicate, or NULL option labels are errors. Typed functions raise an error on
 refusal instead of turning it into false or zero. `decision_answers` preserves
-refusal objects alongside successful answers. For option descriptions and multiple
+refusal objects alongside successful answers. 
+The detail functions return the same answer as `decision_choice` and
+`decision_score`, plus what the provider reports about it:
+
+- `confidence`: DOUBLE from 0 (probability spread evenly) to 1 (all on one option).
+- `probabilities`: MAP(VARCHAR, DOUBLE) from each label to its probability, in
+  the order you gave them. Score levels are keyed by label, not index.
+- `model`: the model id that answered. Providers often resolve an alias to a
+  version (Jev reports a version such as `jev-1.14.0` for `jev-latest`); when a response names no
+  model, this is the requested model.
+
+`confidence` and `probabilities` are NULL when a provider omits them. A
+distribution that is present must cover exactly the supplied labels, with values
+from 0 to 1 summing to 1, or the query fails. Use them to route uncertain rows to
+review instead of acting on them:
+
+```sql
+WITH d AS (
+  SELECT ticket_id, decision_choice_detail(body, 'Which team?', ['support', 'billing', 'shipping']) AS r
+  FROM tickets
+)
+SELECT ticket_id, r.choice,
+       CASE WHEN r.confidence >= 0.8 THEN 'auto' WHEN r.confidence >= 0.4 THEN 'review' ELSE 'manual' END AS route,
+       r.probabilities['billing'] AS billing_share, r.model
+FROM d;
+```
+
+Pick the cutoffs from labeled examples; confidence describes the spread of the
+answer, not whether it is correct.
+
+For option descriptions and multiple
 independent questions about a shared input, pass the documented questions array:
 
 ```sql
