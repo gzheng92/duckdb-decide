@@ -16,6 +16,7 @@ clef_requests = []
 jev_requests = []
 attempts = 0
 overloaded = 0
+unavailable = 0
 in_flight = 0
 peak = 0
 lock = threading.Lock()
@@ -72,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({'success': True, 'result': reply} if wrap and state != 'bare' else reply).encode())
 
     def do_POST(self):
-        global attempts, overloaded, in_flight, peak
+        global attempts, overloaded, unavailable, in_flight, peak
         if self.path == '/clef':
             return self.do_systemone('cf-token', clef_requests, wrap=True)
         if self.path == '/v1/systemone':
@@ -104,6 +105,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(529); self.send_header('retry-after-ms', '1200'); self.end_headers(); return
         if text == 'slow-down':
             self.send_response(429); self.send_header('Retry-After', '120'); self.end_headers(); return
+        if text == 'unavailable':
+            unavailable += 1
+            if unavailable == 1:
+                self.send_response(503); self.end_headers(); return
+        if text == 'no-quota':
+            self.send_response(429); self.end_headers()
+            self.wfile.write(json.dumps({'error': {'message': 'You exceeded your current quota', 'type': 'insufficient_quota', 'code': 'insufficient_quota'}}).encode()); return
         if text == 'busy':
             self.send_response(529); self.end_headers(); return
         if text == 'invalid-question':
@@ -305,8 +313,20 @@ try:
     rows = run("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(6) t(i)")
     assert len(rows) == 6 and len(requests) == before + 2
     before = len(requests)
-    run("SELECT decision_prob(repeat('x',18000000),'Q')", fail='16 MiB')
+    run("SELECT decision_prob(repeat('x',10000000),'Q')", fail='Request exceeds the 9 MiB request limit for OpenAI Decisions')
     assert len(requests) == before
+    # OpenAI GA limits: 2-255 choices, up to 10 levels, 400 questions per request; nothing is sent.
+    run("SELECT decision_choice('x','Q',['only'])", fail='OpenAI Decisions needs at least 2 choices')
+    run("SELECT decision_score('x','Q',[i::VARCHAR FOR i IN range(11)])", fail='OpenAI Decisions accepts at most 10 score levels')
+    many = json.dumps([{'type':'predicate','name':f'q{i}','instructions':'Q'} for i in range(401)])
+    run(f"SELECT decision_answers('x','{many}')", fail='OpenAI Decisions accepts at most 400 questions per request')
+    assert len(requests) == before
+    # 503 (OpenAI's overloaded) is retried; a 429 for an exhausted quota is not.
+    before = len(requests)
+    assert run("SELECT decision_prob('unavailable','Q') AS v")[0]['v'] == .8 and len(requests) == before + 2
+    before = len(requests)
+    run("SELECT decision_prob('no-quota','Q')", fail='HTTP 429: You exceeded your current quota')
+    assert len(requests) == before + 1
     assert run("SELECT decision_prob('retry','Q') AS v")[0]['v'] == .8 and attempts == 2
     # 529 is retried too, waiting at least as long as retry-after-ms asks.
     started, before = time.monotonic(), len(requests)
@@ -377,14 +397,14 @@ try:
     cf("SELECT decision_score('x','Q',[i::VARCHAR FOR i IN range(11)])", fail='at most 10 score levels')
     cf("SELECT decision_choice('row ' || i,'Q', CASE WHEN i = 5 THEN ['a'] ELSE ['a','b'] END) FROM range(10) t(i)", fail='at least 2 choices')
     cf(f"SELECT decision_answers('x','{json.dumps([{'type':'choice','name':'c','instructions':'Q','choices':[{'value':'a'}]}])}')", fail='at least 2 choices')
-    cf("SELECT decision_prob(repeat('x',14000000),'Q')", fail="Cloudflare Clef's 13 MiB request limit")
+    cf("SELECT decision_prob(repeat('x',14000000),'Q')", fail="the 13 MiB request limit for Cloudflare Clef")
     cf(f"SELECT decision_answers('x','{json.dumps([{'type':7,'name':'c','instructions':'Q'}])}')", fail='Unknown question type')
     assert len(clef_requests) == before
     rows = cf("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(5) t(i)")
     assert len(rows) == 5 and len(clef_requests) == before + 2  # 15 MB splits under Clef's limit
     before = len(requests)
     run("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(5) t(i)")
-    assert len(requests) == before + 1  # the same rows fit OpenAI's 16 MiB in one request
+    assert len(requests) == before + 2  # OpenAI's 9 MiB cap splits them too
     cf("SELECT decision_prob('invalid-question','Q')", fail='Cloudflare Clef HTTP 422: [{"loc":["body","questions"],"msg":"bad criteria"}] (request id ts_req_42)')
     cf("SET decisions_model='gpt'; SELECT decision_prob('x','Q')", fail='clef-flash')
     cf("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='cloudflare';", fail='CLOUDFLARE_API_TOKEN')
@@ -421,6 +441,10 @@ try:
     jev("SELECT decision_prob('extra-answer','Q')", fail='answer count mismatch')
     jev("SELECT decision_prob('unauthorized','Q')", fail='TypeSafe Jev HTTP 401')
     before = len(jev_requests)
+    jev("SELECT decision_prob(repeat('x',18000000),'Q')", fail="extension's 16 MiB limit")  # Jev sets no smaller cap
+    rows = jev("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(5) t(i)")
+    assert len(rows) == 5 and len(jev_requests) == before + 1  # 15 MB fits in one request
+    before = len(jev_requests)
     assert jev("SELECT decision_choice('row 0','Q',['only']) AS v")[0]['v'] == 'only'  # Jev allows one choice
     jev("SELECT decision_choice('x','Q',[i::VARCHAR FOR i IN range(256)])", fail='TypeSafe Jev accepts at most 255 choices')
     jev("SELECT decision_score('x','Q',[i::VARCHAR FOR i IN range(11)])", fail='TypeSafe Jev accepts at most 10 score levels')
@@ -438,7 +462,7 @@ CREATE SECRET only_jev (TYPE decisions, API_KEY 'jev-key', SCOPE 'decisions://je
     assert run("SELECT decision_prob('yes','Q') AS v", prefix=scoped + "SET decisions_provider='jev';\n" + jev_setup.split('\n')[2] + '\n')[0]['v'] == .8
     providers = run("SELECT name, format, default_model, key_env, array_to_string(secret_keys, ',') AS secret_keys, max_questions::INTEGER AS max_questions FROM decision_providers() ORDER BY name")
     assert [(p['name'], p['format'], p['default_model'], p['max_questions']) for p in providers] == [
-        ('cloudflare', 'systemone', 'clef', 64), ('jev', 'systemone', 'jev-latest', None), ('openai', 'openai', 'gpt-6-luna', None)]
+        ('cloudflare', 'systemone', 'clef', 64), ('jev', 'systemone', 'jev-latest', None), ('openai', 'openai', 'gpt-6-luna', 400)]
     assert providers[0]['secret_keys'] == 'api_key,account_id' and providers[1]['key_env'] == 'TYPESAFE_API_KEY'
     print('Passed SQL/HTTP integration checks, including batching, NULL mapping, chunk boundaries, payload splitting, and failures; no live API requests.')
 finally:

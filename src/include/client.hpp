@@ -30,7 +30,7 @@ struct Config {
     // Largest request body to send: the provider's limit, or the extension's 16 MiB.
     size_t MaxBytes() const { return Spec().max_request_mib ? Spec().max_request_mib * 1024 * 1024 : MAX_BYTES; }
     std::string LimitText() const {
-        return Spec().max_request_mib ? Name() + "'s " + std::to_string(Spec().max_request_mib) + " MiB request limit" : "extension's 16 MiB limit";
+        return Spec().max_request_mib ? "the " + std::to_string(Spec().max_request_mib) + " MiB request limit for " + Name() : "extension's 16 MiB limit";
     }
     std::string Url() const {
         if (!endpoint.empty()) return endpoint;
@@ -184,6 +184,16 @@ inline size_t ReceiveHeader(char *data, size_t size, size_t count, void *target)
     }
     return size * count;
 }
+// OpenAI answers 429 both for rate limits, which clear, and for an exhausted quota or budget,
+// which retrying cannot fix.
+inline bool QuotaExhausted(const std::string &body) {
+    auto json = Json::parse(body, nullptr, false);
+    if (json.is_discarded() || !json.is_object() || !json.contains("error") || !json["error"].is_object()) return false;
+    const auto &error = json["error"];
+    for (const char *field : {"code", "type"})
+        if (error.contains(field) && error[field] == "insufficient_quota") return true;
+    return false;
+}
 // A short, single-line explanation from an error body: TypeSafe's "detail", OpenAI's
 // error.message, or Cloudflare's errors[0].message. Empty when the body has none.
 inline std::string ErrorDetail(const std::string &body, const std::string &key) {
@@ -262,9 +272,10 @@ inline Json Evaluate(const Config &c, const std::string &input, const Json &ques
         if (code == CURLE_ABORTED_BY_CALLBACK) throw CancelledError();
         if (code != CURLE_OK) throw std::runtime_error(c.Name() + " transport failed; request not retried");
         long status; curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
-        // 429 (rate limited) and 529 (overloaded) mean the request was not processed, so a retry
-        // cannot double-bill. Wait at least as long as the server asks, up to a cap.
-        bool busy = status == 429 || status == 529;
+        // 429 (rate limited), 503 (OpenAI: overloaded) and 529 (System One: overloaded) mean the
+        // request was not processed, so a retry cannot double-bill. Wait at least as long as the
+        // server asks, up to a cap. A 429 for an exhausted quota will not clear, so it fails at once.
+        bool busy = (status == 429 && !QuotaExhausted(buffer)) || status == 503 || status == 529;
         if (busy && received.retry_after_ms > MAX_RETRY_WAIT_MS)
             throw std::runtime_error(c.Name() + " HTTP " + std::to_string(status) + "; server asked to retry after " +
                                      std::to_string((received.retry_after_ms + 999) / 1000) + " s, so the request was not retried");

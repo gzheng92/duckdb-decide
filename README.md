@@ -191,6 +191,13 @@ If no secret matches and the environment variable is unset, queries fail with
 it reads its key the same way, from the scope `decisions://<name>` and its
 `key_env` variable.
 
+OpenAI Decisions accepts up to 400 questions per request, 2 to 255 choices, and
+2 to 10 score levels, and an input of up to 10 MB; the extension keeps OpenAI
+requests under 9 MiB so batched input stays within that. Since general
+availability, OpenAI caches a long input shared across requests automatically
+(see `cached_tokens` in your usage); typed functions batch different rows into
+each request, so expect few cache hits from them.
+
 Jev and Clef share the "System One" request format. Predicates become `noul`
 questions, choices `choice`, and scores `score` (a probability-weighted index
 starting at 0), so results mean the same as with OpenAI. Neither returns refusal
@@ -293,7 +300,7 @@ and counts before they are assigned back to SQL rows. NULL rows are skipped.
 Rows with the same input, question, and options are sent once per chunk, and
 every copy gets that answer (each `decision` row still applies its own
 threshold), so repeated values cost one evaluation per chunk. Large batches are
-split to stay within the 16 MiB request limit.
+split to stay within the provider's request limit (16 MiB at most).
 
 ```sql
 SET decisions_batch_size = 20; -- allowed extension range: 1 through 128
@@ -331,8 +338,9 @@ network calls. Repeating calls can incur repeated charges, so materialize result
 you plan to reuse.
 
 Requests time out after 30 seconds (10-second connection timeout). HTTP 429
-(rate limited) and 529 (overloaded) are retried at most twice with backoff,
-waiting at least as long as the server's `Retry-After` or `retry-after-ms`
+(rate limited), 503 (OpenAI: overloaded), and 529 (System One: overloaded) are
+retried at most twice with backoff, except a 429 for an exhausted quota, which
+fails at once. Retries wait at least as long as the server's `Retry-After` or `retry-after-ms`
 header asks; if the server asks for more than 20 seconds, the query fails at once
 with that wait in the message. Transport failures are not retried because
 billing status is ambiguous. Other HTTP failures are reported by status code, with
