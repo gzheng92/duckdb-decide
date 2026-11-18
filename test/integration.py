@@ -60,8 +60,11 @@ class Handler(BaseHTTPRequestHandler):
                 answers[name] = {'type': 'choice', 'choice': pick, 'probabilities': {o: 1 / len(options) for o in options}, 'confidence': .5}
             else:
                 assert isinstance(q['criteria'], list)
-                answers[name] = {'type': 'score', 'score': n % len(q['criteria']) if n is not None else 1.25, 'legend': {}, 'probabilities': {}, 'confidence': .5}
-        reply = {'model': body['model'], 'answers': answers, 'usage': {'input_tokens': 1, 'output_tokens': 0}}
+                levels = len(q['criteria'])
+                dist = {str(i): (1.0 if i == n % levels else 0.0) for i in range(levels)} if n is not None else {str(i): {1: .75, 2: .25}.get(i, 0.0) for i in range(levels)}
+                answers[name] = {'type': 'score', 'score': n % levels if n is not None else 1.25, 'legend': {str(i): c for i, c in enumerate(q['criteria'])}, 'probabilities': dist, 'confidence': .5}
+        model = 'jev-1.14.0' if body['model'] == 'jev-latest' else body['model']  # aliases resolve to versions
+        reply = {'model': model, 'answers': answers, 'usage': {'input_tokens': 1, 'output_tokens': 0}}
         if state == 'extra-answer':
             reply['answers']['surprise'] = {'type': 'noul', 'noul': .5}
         self.send_response(200); self.end_headers()
@@ -125,14 +128,30 @@ class Handler(BaseHTTPRequestHandler):
             elif q['type'] == 'predicate':
                 a['probability'] = 2 if record == 'invalid' else (.9 if row_number % 2 == 0 else .1) if row_number is not None else .8
             elif q['type'] == 'choice':
-                a['choice'] = 'unknown' if record == 'unknown' else q['choices'][row_number % len(q['choices']) if row_number is not None else 0]['value']
+                values = [c['value'] for c in q['choices']]
+                a['choice'] = 'unknown' if record == 'unknown' else values[row_number % len(values) if row_number is not None else 0]
+                rest = .3 / max(len(values) - 1, 1)
+                a['probabilities'] = [{'value': v, 'probability': .7 if v == a['choice'] else rest} for v in values]
+                a['confidence'] = .6
             elif q['type'] == 'score':
-                a['score'] = row_number % len(q['levels']) if row_number is not None else 1.25
+                levels = len(q['levels'])
+                a['score'] = row_number % levels if row_number is not None else 1.25
+                weights = {row_number % levels: 1.0} if row_number is not None else {1: .75, 2: .25}
+                a['probabilities'] = [{'value': i, 'label': l['label'], 'probability': weights.get(i, 0.0)} for i, l in enumerate(q['levels'])]
+                a['confidence'] = .4
+            if record == 'no-dist':
+                a.pop('probabilities', None); a.pop('confidence', None)
+            if record == 'bad-sum' and 'probabilities' in a:
+                a['probabilities'][0]['probability'] = 0.9
+            if record == 'bad-keys' and 'probabilities' in a:
+                a['probabilities'][0]['value'] = 'surprise'
+            if record == 'bad-confidence' and 'confidence' in a:
+                a['confidence'] = 1.5
             answers.append(a)
         if text == 'wrong-name':
             answers[0]['name'] = 'unexpected'
         self.send_response(200); self.end_headers()
-        self.wfile.write(json.dumps({'answers': answers}).encode())
+        self.wfile.write(json.dumps({'answers': answers, 'model': 'gpt-6-luna-2026-10-01'}).encode())
 
 ThreadingHTTPServer.request_queue_size = 64  # the default of 5 drops bursts of concurrent connects
 server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -254,6 +273,24 @@ try:
     before = len(requests)
     rows = run("SELECT decision_choice('row 1','Q', CASE WHEN i < 4 THEN ['a','b'] ELSE ['a','b','c'] END) AS v FROM range(6) t(i)")
     assert [r['v'] for r in rows] == ['b'] * 6 and len(requests) == before + 2  # options are part of the question
+    # Detail functions: confidence, per-option probabilities (scores keyed by level label), model.
+    # The CI CLI is built without the json extension, so -json prints lists as plain text:
+    # select scalars only (array_to_string for key order, element access for values).
+    detail = run("SELECT d.choice, d.confidence, d.probabilities['a'] AS pa, d.probabilities['b'] AS pb, array_to_string(map_keys(d.probabilities), ',') AS k, d.model "
+                 "FROM (SELECT decision_choice_detail('row 1','Q',['a','b']) AS d)")[0]
+    assert detail == {'choice': 'b', 'confidence': .6, 'pa': .3, 'pb': .7, 'k': 'a,b', 'model': 'gpt-6-luna-2026-10-01'}, detail
+    detail = run("SELECT d.score, d.confidence, array_to_string(map_keys(d.probabilities), ',') AS k, d.probabilities['low'] AS lo, d.probabilities['mid'] AS mid, d.probabilities['high'] AS hi "
+                 "FROM (SELECT decision_score_detail('yes','Severity?',['low','mid','high']) AS d)")[0]
+    assert detail == {'score': 1.25, 'confidence': .4, 'k': 'low,mid,high', 'lo': 0, 'mid': .75, 'hi': .25}, detail
+    rows = run("SELECT (decision_choice_detail('row ' || i,'Q',['a','b','c'])).choice AS v FROM range(6) t(i)")
+    assert [r['v'] for r in rows] == ['a', 'b', 'c'] * 2  # batched rows map back correctly
+    detail = run("SELECT d.confidence IS NULL AS c, d.probabilities IS NULL AS p, d.choice FROM (SELECT decision_choice_detail('no-dist','Q',['a','b']) AS d)")[0]
+    assert detail == {'c': True, 'p': True, 'choice': 'a'}
+    assert run("SELECT decision_choice_detail(NULL,'Q',['a','b']) IS NULL AS v")[0]['v'] is True
+    run("SELECT decision_choice_detail('bad-sum','Q',['a','b'])", fail='do not sum to 1')
+    run("SELECT decision_score_detail('bad-keys','Q',['a','b','c'])", fail='Invalid probability distribution')
+    run("SELECT decision_choice_detail('bad-confidence','Q',['a','b'])", fail='out of range')
+    assert run("SELECT decision_choice('bad-sum','Q',['a','b']) AS v")[0]['v'] == 'a'  # plain functions ignore the distribution
     for size in [0,129]:
         before = len(requests)
         run(f"SET decisions_batch_size={size}; SELECT decision_prob('x','Q')", fail='between 1 and 128')
@@ -332,6 +369,8 @@ try:
     cf(f"SELECT decision_answers('x','{bad}')", fail='may use only letters')
     cf("SELECT decision_choice('unknown','Q',['a','b'])", fail='unknown choice')
     cf("SELECT decision_prob('unauthorized','Q')", fail='Cloudflare Clef HTTP 401')
+    detail = cf("SELECT d.choice, d.confidence, d.probabilities['a'] AS pa, d.probabilities['b'] AS pb, d.model FROM (SELECT decision_choice_detail('yes','Q',['a','b']) AS d)")[0]
+    assert detail == {'choice': 'a', 'confidence': .5, 'pa': .5, 'pb': .5, 'model': 'clef'}, detail
     # Clef's own limits: 2-255 choices, 2-10 levels, 13 MiB bodies. Nothing is sent when one is broken.
     before = len(clef_requests)
     cf("SELECT decision_choice('x','Q',['a'])", fail='Cloudflare Clef needs at least 2 choices')
@@ -362,6 +401,8 @@ try:
     assert jev("SELECT decision_choice('yes','Route?', ['billing','other']) AS v")[0]['v'] == 'billing'
     assert jev_requests[-1]['questions']['decision']['criteria'] == {'billing': 'billing', 'other': 'other'}
     assert jev("SELECT decision_score('yes','Severity?', ['low','medium','high']) AS v")[0]['v'] == 1.25
+    detail = jev("SELECT d.score, array_to_string(map_keys(d.probabilities), ',') AS k, d.probabilities['medium'] AS mid, d.probabilities['high'] AS hi, d.model FROM (SELECT decision_score_detail('yes','Severity?',['low','medium','high']) AS d)")[0]
+    assert detail == {'score': 1.25, 'k': 'low,medium,high', 'mid': .75, 'hi': .25, 'model': 'jev-1.14.0'}, detail  # the resolved version
     before = len(jev_requests)
     rows = jev("SET decisions_batch_size=128; SELECT decision_prob('row ' || i,'Q') AS v FROM range(130) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(130)]

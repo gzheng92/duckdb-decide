@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #include <chrono>
 #include <functional>
 namespace decide {
@@ -87,6 +88,45 @@ inline double Number(const Json &a, const char *field, double low, double high) 
     double n = a[field].get<double>();
     if (!std::isfinite(n) || n < low || n > high) throw std::runtime_error("Decision answer out of range");
     return n;
+}
+// An answer's probability for each key, in key order, or null when the answer has none.
+// Keys are choice values, or level indexes as strings for scores. OpenAI sends an array of
+// {value, probability}; System One sends an object keyed the same way. A distribution that is
+// present must cover exactly these keys, each in [0, 1], summing to 1.
+inline Json Distribution(const Json &a, const std::vector<std::string> &keys) {
+    if (!a.contains("probabilities") || a["probabilities"].is_null()) return nullptr;
+    auto invalid = [] { return std::runtime_error("Invalid probability distribution in decision answer"); };
+    Json p = a["probabilities"];
+    if (p.is_array()) {
+        Json map = Json::object();
+        for (const auto &entry : p) {
+            if (!entry.is_object() || !entry.contains("value") || !entry.contains("probability")) throw invalid();
+            const auto &value = entry["value"];
+            std::string key;
+            if (value.is_string()) key = value.get<std::string>();
+            else if (value.is_number_integer()) key = std::to_string(value.get<long long>());
+            else throw invalid();
+            if (map.contains(key)) throw invalid();
+            map[key] = entry["probability"];
+        }
+        p = std::move(map);
+    }
+    if (!p.is_object() || p.size() != keys.size()) throw invalid();
+    Json out = Json::array();
+    double sum = 0;
+    for (const auto &key : keys) {
+        if (!p.contains(key)) throw invalid();
+        double v = Number(p, key.c_str(), 0, 1);
+        sum += v;
+        out.push_back(v);
+    }
+    if (std::fabs(sum - 1) > 0.01) throw std::runtime_error("Decision answer probabilities do not sum to 1");
+    return out;
+}
+// An answer's confidence in [0, 1], or null when the answer has none.
+inline Json Confidence(const Json &a) {
+    if (!a.contains("confidence") || a["confidence"].is_null()) return nullptr;
+    return Number(a, "confidence", 0, 1);
 }
 inline Json Answers(const Json &response, const Json &questions) {
     if (!response.is_object() || !response.contains("answers") || !response["answers"].is_array() || response["answers"].size() != questions.size()) throw std::runtime_error("Decision response answer count mismatch");
@@ -175,7 +215,10 @@ inline void InitHttp() {
     static const auto initialized = [] { if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) throw std::runtime_error("HTTP initialization failed"); return true; }();
     (void)initialized;
 }
-inline Json Evaluate(const Config &c, const std::string &input, const Json &questions, const Cancelled &cancelled = Cancelled()) {
+// served_model, when given, receives the model id the response names (often a resolved version
+// of an alias such as jev-latest), or the requested model when the response names none.
+inline Json Evaluate(const Config &c, const std::string &input, const Json &questions, const Cancelled &cancelled = Cancelled(),
+                     std::string *served_model = nullptr) {
     Validate(c);
     if (!questions.is_array() || questions.empty()) throw std::runtime_error("Questions must be a nonempty array");
     for (const auto &q : questions) {
@@ -243,7 +286,15 @@ inline Json Evaluate(const Config &c, const std::string &input, const Json &ques
         }
         auto response = Json::parse(buffer, nullptr, false);
         if (response.is_discarded()) throw std::runtime_error("Invalid " + c.Name() + " JSON");
-        return Answers(c.provider->wire->Decode(response, questions), questions);
+        auto decoded = c.provider->wire->Decode(response, questions);
+        auto answers = Answers(decoded, questions);
+        if (served_model) {
+            *served_model = c.Model();
+            if (decoded.is_object() && decoded.contains("model") && decoded["model"].is_string() &&
+                SafeModelId(decoded["model"].get<std::string>(), false))
+                *served_model = decoded["model"].get<std::string>();
+        }
+        return answers;
     }
     throw std::runtime_error(c.Name() + " retries exhausted");
 }
