@@ -19,7 +19,9 @@ LOAD decide;
 Community builds are signed and load in the normal DuckDB CLI. Configure your
 provider credentials before evaluating rows; see [Setting API keys](#setting-api-keys).
 TypeSafe Jev, provider files, `decision_providers()`, and per-provider secret
-scopes need extension 0.2.1 or later. Check your installed version with
+scopes need extension 0.2.1 or later. `decision_choice_detail`,
+`decision_score_detail`, `decisions_concurrency`, and per-provider request limits
+need 0.2.2 or later. Check your installed version with
 `SELECT extension_version FROM duckdb_extensions() WHERE extension_name = 'decide';`
 and run `UPDATE EXTENSIONS (decide);` to pick up the latest community build.
 
