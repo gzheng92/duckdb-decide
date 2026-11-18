@@ -16,10 +16,19 @@ clef_requests = []
 jev_requests = []
 attempts = 0
 overloaded = 0
+in_flight = 0
+peak = 0
+lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client aborted the request, e.g. after another one failed
 
     def do_systemone(self, token, log, wrap):
         """System One format, shared by Cloudflare Clef (wrapped in a REST envelope) and TypeSafe Jev."""
@@ -60,7 +69,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({'success': True, 'result': reply} if wrap and state != 'bare' else reply).encode())
 
     def do_POST(self):
-        global attempts, overloaded
+        global attempts, overloaded, in_flight, peak
         if self.path == '/clef':
             return self.do_systemone('cf-token', clef_requests, wrap=True)
         if self.path == '/v1/systemone':
@@ -77,6 +86,15 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(429); self.end_headers(); return
         if text == 'unauthorized':
             self.send_response(401); self.end_headers(); return
+        if text.startswith('sleep '):  # 'sleep <seconds> <id>': a slow answer, counting overlap
+            with lock:
+                in_flight += 1; peak = max(peak, in_flight)
+            try:
+                time.sleep(float(text.split()[1]))
+            finally:
+                with lock:
+                    in_flight -= 1
+            text = 'yes'
         if text == 'overloaded':
             overloaded += 1
             if overloaded == 1:  # the first attempt is overloaded; the retry succeeds
@@ -116,6 +134,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200); self.end_headers()
         self.wfile.write(json.dumps({'answers': answers}).encode())
 
+ThreadingHTTPServer.request_queue_size = 64  # the default of 5 drops bursts of concurrent connects
 server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 setup = f"""LOAD '{EXT}';
@@ -170,7 +189,7 @@ try:
     rows = run("SELECT decision_prob('row ' || i,'Q') AS v FROM range(45) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(45)]
     assert len(requests) == before + 3
-    assert [len(r['questions']) for r in requests[before:]] == [20, 20, 5]
+    assert sorted(len(r['questions']) for r in requests[before:]) == sorted([20, 20, 5])
     before = len(requests)
     rows = run("SET decisions_batch_size=1; SELECT decision_prob('row ' || i,'Q') AS v FROM range(4) t(i)")
     assert len(requests) == before + 4 and [r['v'] for r in rows] == [.9, .1, .9, .1]
@@ -192,6 +211,31 @@ try:
     rows = run("SELECT decision_prob('row ' || i,'Q') AS v FROM range(2065) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(2065)]
     assert len(requests) == before + 104  # 103 batches for 2048 rows, one for 17
+    # Requests in a chunk run up to decisions_concurrency at a time; results keep row order.
+    def slow(sql):
+        global peak
+        peak = 0
+        started = time.monotonic()
+        rows = run(sql)
+        return rows, time.monotonic() - started
+    before = len(requests)
+    rows, took = slow("SET decisions_batch_size=1; SELECT i, decision_prob('sleep 0.6 ' || i,'Q') AS v FROM range(8) t(i)")
+    assert [r['i'] for r in rows] == list(range(8)) and [r['v'] for r in rows] == [.8] * 8
+    assert len(requests) == before + 8 and peak == 4 and took < 3.5  # default 4: two rounds, not eight
+    rows, took = slow("SET decisions_batch_size=1; SET decisions_concurrency=8; SELECT decision_prob('sleep 0.6 ' || i,'Q') AS v FROM range(8) t(i)")
+    assert peak == 8 and took < 2.5, (peak, took)
+    rows, took = slow("SET decisions_batch_size=1; SET decisions_concurrency=1; SELECT decision_prob('sleep 0.2 ' || i,'Q') AS v FROM range(4) t(i)")
+    assert peak == 1 and took >= .8
+    questions_slow = json.dumps([{'type':'predicate','name':'one','instructions':'Q'}])
+    rows, took = slow(f"SET decisions_concurrency=3; SELECT decision_answers('sleep 0.6 ' || i,'{questions_slow}') AS v FROM range(6) t(i)")
+    assert len(rows) == 6 and peak == 3 and took < 3
+    for size in [0, 33]:
+        run(f"SET decisions_concurrency={size}; SELECT decision_prob('x','Q')", fail='between 1 and 32')
+    # The first failure stops new requests and aborts slow ones already in flight.
+    before = len(requests)
+    started = time.monotonic()
+    run("SET decisions_batch_size=1; SET decisions_concurrency=2; SELECT decision_prob(x,'Q') FROM (VALUES ('unauthorized'), ('sleep 5 a'), ('sleep 5 b'), ('sleep 5 c'), ('sleep 5 d')) t(x)", fail='HTTP 401')
+    assert time.monotonic() - started < 4 and len(requests) - before <= 3
     # Identical (input, question) rows in a chunk are sent once and share the answer.
     before = len(requests)
     rows = run("SELECT decision_prob('row ' || (i % 3),'Q') AS v FROM range(12) t(i)")
@@ -273,10 +317,10 @@ try:
     before = len(clef_requests)
     rows = cf("SELECT decision_prob('row ' || i,'Q') AS v FROM range(150) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(150)]
-    assert [len(r['questions']) for r in clef_requests[before:]] == [20] * 7 + [10]
+    assert sorted(len(r['questions']) for r in clef_requests[before:]) == sorted([20] * 7 + [10])
     before = len(clef_requests)
     cf("SET decisions_batch_size=128; SELECT decision_prob('row ' || i,'Q') AS v FROM range(130) t(i)")
-    assert [len(r['questions']) for r in clef_requests[before:]] == [64, 64, 2]
+    assert sorted(len(r['questions']) for r in clef_requests[before:]) == sorted([64, 64, 2])
     rows = cf("SET decisions_model='clef-flash'; SELECT decision_prob('yes','Q') AS v")
     assert clef_requests[-1]['model'] == 'clef-flash'
     questions = json.dumps([{'type':'predicate','name':'one','instructions':'Q'},
@@ -321,7 +365,7 @@ try:
     before = len(jev_requests)
     rows = jev("SET decisions_batch_size=128; SELECT decision_prob('row ' || i,'Q') AS v FROM range(130) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(130)]
-    assert [len(r['questions']) for r in jev_requests[before:]] == [128, 2]  # no provider cap, unlike Clef
+    assert sorted(len(r['questions']) for r in jev_requests[before:]) == sorted([128, 2])  # no provider cap, unlike Clef
     jev("SET decisions_model='jev-1.14.0'; SELECT decision_prob('yes','Q') AS v")
     assert jev_requests[-1]['model'] == 'jev-1.14.0'
     spaced = json.dumps([{'type':'predicate','name':'has space','instructions':'Q'}])

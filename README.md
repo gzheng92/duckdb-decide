@@ -275,13 +275,28 @@ extension technique using multiple API questions, not a native multi-input API.
 per distinct row (identical input and questions in a chunk share one request);
 its explicit questions already share that row's input.
 
-Requests execute sequentially within each chunk. Deduplication applies only
-within a chunk (about 2,048 rows); there is no persistent cache across chunks or
-queries, and no extension-managed concurrency pool. To evaluate each value exactly
-once across a whole table, run the function over `SELECT DISTINCT` and join back.
+Each chunk's requests run up to **4 at a time** by default:
+
+```sql
+SET decisions_concurrency = 8; -- allowed range: 1 through 32
+SET decisions_concurrency = 1; -- one request at a time
+```
+
+Results keep row order. The first failed request in a chunk (for example an HTTP
+error) stops new requests and aborts those in flight, and that first error is
+reported; requests already sent may still be billed. Refusals are answers, so they
+are reported once the chunk's requests finish. Ctrl-C
+and other query interrupts abort in-flight requests and retry waits within about
+a second. DuckDB can run several chunks at once on its own threads, so the
+number of requests in flight can reach `decisions_concurrency` times the thread
+count; lower either setting (or `SET threads`) if your provider rate-limits you.
+
+Deduplication applies only within a chunk (about 2,048 rows); there is no
+persistent cache across chunks or queries. To evaluate each value exactly once
+across a whole table, run the function over `SELECT DISTINCT` and join back.
 Functions are marked volatile to prevent the SQL optimizer from precomputing
-network calls. Repeating calls can incur repeated
-charges, so materialize results you plan to reuse.
+network calls. Repeating calls can incur repeated charges, so materialize results
+you plan to reuse.
 
 Requests time out after 30 seconds (10-second connection timeout). HTTP 429
 (rate limited) and 529 (overloaded) are retried at most twice with backoff,

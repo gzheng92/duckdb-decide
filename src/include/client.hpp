@@ -12,6 +12,7 @@
 #include <string>
 #include <thread>
 #include <chrono>
+#include <functional>
 namespace decide {
 using Json = nlohmann::ordered_json;
 constexpr size_t MAX_BYTES = 16 * 1024 * 1024;
@@ -159,7 +160,22 @@ inline std::string ErrorDetail(const std::string &body, const std::string &key) 
     if (text.size() > 300) text = text.substr(0, 300) + "...";
     return text;
 }
-inline Json Evaluate(const Config &c, const std::string &input, const Json &questions) {
+// Returns true once the request should stop: the query was interrupted or another request in
+// the same chunk failed. Checked while transfers run and between retries.
+using Cancelled = std::function<bool()>;
+struct CancelledError : std::runtime_error {
+    CancelledError() : std::runtime_error("request cancelled") {}
+};
+inline int OnProgress(void *target, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    const auto &cancelled = *static_cast<const Cancelled *>(target);
+    return cancelled && cancelled() ? 1 : 0; // nonzero aborts the transfer
+}
+// Global libcurl setup; call before starting request threads.
+inline void InitHttp() {
+    static const auto initialized = [] { if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) throw std::runtime_error("HTTP initialization failed"); return true; }();
+    (void)initialized;
+}
+inline Json Evaluate(const Config &c, const std::string &input, const Json &questions, const Cancelled &cancelled = Cancelled()) {
     Validate(c);
     if (!questions.is_array() || questions.empty()) throw std::runtime_error("Questions must be a nonempty array");
     for (const auto &q : questions) {
@@ -169,8 +185,8 @@ inline Json Evaluate(const Config &c, const std::string &input, const Json &ques
         if (q["type"] == "score" && (!q.contains("levels") || !q["levels"].is_array() || q["levels"].size() < 2)) throw std::runtime_error("Missing score levels");
     }
     CheckLimits(c.Spec(), questions);
-    static const auto initialized = [] { if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) throw std::runtime_error("HTTP initialization failed"); return true; }();
-    (void)initialized;
+    InitHttp();
+    if (cancelled && cancelled()) throw CancelledError();
     auto payload = c.provider->wire->Encode(c.Model(), input, questions).dump();
     if (payload.size() > c.MaxBytes()) throw std::runtime_error("Request exceeds " + c.LimitText());
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
@@ -191,12 +207,17 @@ inline Json Evaluate(const Config &c, const std::string &input, const Json &ques
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, Receive);
     curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, ReceiveHeader);
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, OnProgress);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &cancelled);
     for (int attempt = 0; attempt < 3; ++attempt) {
         std::string buffer;
         ResponseHeaders received;
         curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &buffer);
         curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &received);
-        if (curl_easy_perform(curl.get()) != CURLE_OK) throw std::runtime_error(c.Name() + " transport failed; request not retried");
+        auto code = curl_easy_perform(curl.get());
+        if (code == CURLE_ABORTED_BY_CALLBACK) throw CancelledError();
+        if (code != CURLE_OK) throw std::runtime_error(c.Name() + " transport failed; request not retried");
         long status; curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
         // 429 (rate limited) and 529 (overloaded) mean the request was not processed, so a retry
         // cannot double-bill. Wait at least as long as the server asks, up to a cap.
@@ -206,7 +227,11 @@ inline Json Evaluate(const Config &c, const std::string &input, const Json &ques
                                      std::to_string((received.retry_after_ms + 999) / 1000) + " s, so the request was not retried");
         if (busy && attempt < 2) {
             long wait = std::max<long>(500L * (1 << attempt), received.retry_after_ms);
-            std::this_thread::sleep_for(std::chrono::milliseconds(wait));
+            // Sleep in short steps so an interrupt or a failed sibling request ends the wait.
+            for (long slept = 0; slept < wait; slept += 50) {
+                if (cancelled && cancelled()) throw CancelledError();
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::min<long>(50, wait - slept)));
+            }
             continue;
         }
         if (status < 200 || status >= 300) {
