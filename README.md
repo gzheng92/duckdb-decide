@@ -25,20 +25,21 @@ and run `UPDATE EXTENSIONS (decide);` to pick up the latest community build.
 
 ## DuckDB compatibility
 
-DuckDB loads an extension only into the DuckDB version it was built for, so each
-DuckDB line has its own branch and release series:
+DuckDB loads an extension only into the DuckDB version it was built for. Only
+DuckDB **2.0.x** (LTS) is supported, on the
+[`v2.x`](https://github.com/gzheng92/duckdb-decide/tree/v2.x) branch with extension
+releases `v0.2.*`.
 
-| DuckDB | Branch | Extension releases |
-| --- | --- | --- |
-| 2.0.x (LTS) | [`v2.x`](https://github.com/gzheng92/duckdb-decide/tree/v2.x) | `v0.2.*` |
-| 1.5.x | [`v1.x`](https://github.com/gzheng92/duckdb-decide/tree/v1.x) | `v0.1.*` |
+DuckDB versions before 2.0 are no longer supported. The last release for DuckDB
+1.5.x is [`v0.1.1`](https://github.com/gzheng92/duckdb-decide/releases/tag/v0.1.1);
+its code stays on the [`v1.x`](https://github.com/gzheng92/duckdb-decide/tree/v1.x)
+branch but receives no further fixes or releases. Upgrade to DuckDB 2.0 for new
+features and fixes.
 
 Prebuilt binaries for each release are attached to
-[GitHub Releases](https://github.com/gzheng92/duckdb-decide/releases); pick the release
-matching your DuckDB version. Supported platforms: Linux (x86_64, ARM64), macOS on
-Apple Silicon, and Windows (x86_64). Intel Macs and DuckDB-Wasm are not supported.
-Fixes land on both lines while 1.5.x is supported.
-See [RELEASING.md](RELEASING.md).
+[GitHub Releases](https://github.com/gzheng92/duckdb-decide/releases). Supported
+platforms: Linux (x86_64, ARM64), macOS on Apple Silicon, and Windows (x86_64).
+Intel Macs and DuckDB-Wasm are not supported. See [RELEASING.md](RELEASING.md).
 
 Each release has one zip per platform, holding `decide.duckdb_extension`. Keep that
 file name when you `LOAD` it: DuckDB derives the extension's entry point from the
@@ -120,8 +121,8 @@ Each provider looks for its key in this order:
 3. the provider's environment variable.
 
 > **Version note:** per-provider scopes need extension 0.2.1 or later. Version
-> 0.2.0 and the 1.x line only look for secrets without a scope. On those versions,
-> omit `SCOPE` (for example `CREATE OR REPLACE SECRET openai_key (TYPE decisions, API_KEY
+> 0.2.0 and the unsupported 0.1.x releases only look for secrets without a scope.
+> On those versions, omit `SCOPE` (for example `CREATE OR REPLACE SECRET openai_key (TYPE decisions, API_KEY
 > 'sk-...')`) or use the environment variables below. Those versions support only
 > OpenAI and Cloudflare Clef.
 
