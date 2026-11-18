@@ -195,9 +195,12 @@ Jev and Clef share the "System One" request format. Predicates become `noul`
 questions, choices `choice`, and scores `score` (a probability-weighted index
 starting at 0), so results mean the same as with OpenAI. Neither returns refusal
 answers. Clef has extra limits: 64 questions per request (so batches are capped
-at 64), question names of letters, digits, `_`, `.`, `-` only, and truncation of
-long text to fit its 65,536-token context. Jev has no question cap and a
-64K-token request limit (32K for the input plus any one question). Images are
+at 64), 13 MiB per request (larger batches are split), 2 to 255 choices, 2 to 10
+score levels, question names of letters, digits, `_`, `.`, `-` only, and
+truncation of long text to fit its 65,536-token context. Jev has no question cap,
+1 to 255 choices, up to 10 score levels, and a 64K-token request limit (32K for
+the input plus any one question). Option counts are checked for every row before
+any request is sent. Images are
 not supported for any provider.
 
 ### Adding a provider
@@ -273,11 +276,16 @@ extension-managed concurrency pool. Functions are marked volatile to prevent the
 SQL optimizer from precomputing network calls. Repeating calls can incur repeated
 charges, so materialize results you plan to reuse.
 
-Requests time out after 30 seconds (10-second connection timeout). HTTP 429 is
-retried at most twice with backoff; transport failures are not retried because
-billing status is ambiguous. Other HTTP failures are surfaced by status code;
-response bodies, input text, and API keys are not logged by the HTTP client.
-The extension limits request and response payloads to 16 MiB. It respects
+Requests time out after 30 seconds (10-second connection timeout). HTTP 429
+(rate limited) and 529 (overloaded) are retried at most twice with backoff,
+waiting at least as long as the server's `Retry-After` or `retry-after-ms`
+header asks; if the server asks for more than 20 seconds, the query fails at once
+with that wait in the message. Transport failures are not retried because
+billing status is ambiguous. Other HTTP failures are reported by status code, with
+the server's explanation (up to 300 characters, API key redacted) and its request
+id when it sends one. Input text and API keys are not logged by the HTTP client.
+The extension limits request and response payloads to 16 MiB, or less when the
+provider file sets `max_request_mib`. It respects
 DuckDB's `enable_external_access=false` setting. Images and custom regional
 endpoints are not supported.
 

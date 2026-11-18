@@ -83,8 +83,8 @@ static void PlanBatch(const decide::Config &config, const vector<PendingRow *> &
         batch.input = Json({{"rows", evidence}}).dump();
     }
     auto bytes = config.provider->wire->Encode(config.Model(), batch.input, batch.questions).dump().size();
-    if (bytes > decide::MAX_BYTES) {
-        if (rows.size() == 1) throw std::runtime_error("Request exceeds extension's 16 MiB limit");
+    if (bytes > config.MaxBytes()) {
+        if (rows.size() == 1) throw std::runtime_error("Request exceeds " + config.LimitText());
         auto middle = rows.begin() + rows.size() / 2;
         PlanBatch(config, vector<PendingRow *>(rows.begin(), middle), batches);
         PlanBatch(config, vector<PendingRow *>(middle, rows.end()), batches);
@@ -128,6 +128,8 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         }
         if (pending.empty()) return;
         auto config = Configuration(state.GetContext());
+        // Check provider limits for every row before any paid request is sent.
+        for (const auto &row : pending) decide::CheckLimits(config.Spec(), row.questions);
         if (MODE == Mode::Answers) {
             // Preserve user-defined names and shared-input semantics for explicit questions.
             for (const auto &row : pending) result.SetValue(row.row, Value(decide::Evaluate(config, row.input, row.questions).dump()));

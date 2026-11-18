@@ -5,6 +5,7 @@ import pathlib
 import shutil
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -14,6 +15,7 @@ requests = []
 clef_requests = []
 jev_requests = []
 attempts = 0
+overloaded = 0
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
@@ -28,6 +30,9 @@ class Handler(BaseHTTPRequestHandler):
         state = body['state']
         if state == 'unauthorized':
             self.send_response(401); self.end_headers(); return
+        if state == 'invalid-question':
+            self.send_response(422); self.send_header('x-typesafe-request-id', 'ts_req_42'); self.end_headers()
+            self.wfile.write(json.dumps({'detail': [{'loc': ['body', 'questions'], 'msg': 'bad criteria'}]}).encode()); return
         evidence = None
         if state.startswith('{'):
             try:
@@ -55,7 +60,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({'success': True, 'result': reply} if wrap and state != 'bare' else reply).encode())
 
     def do_POST(self):
-        global attempts
+        global attempts, overloaded
         if self.path == '/clef':
             return self.do_systemone('cf-token', clef_requests, wrap=True)
         if self.path == '/v1/systemone':
@@ -72,6 +77,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(429); self.end_headers(); return
         if text == 'unauthorized':
             self.send_response(401); self.end_headers(); return
+        if text == 'overloaded':
+            overloaded += 1
+            if overloaded == 1:  # the first attempt is overloaded; the retry succeeds
+                self.send_response(529); self.send_header('retry-after-ms', '1200'); self.end_headers(); return
+        if text == 'slow-down':
+            self.send_response(429); self.send_header('Retry-After', '120'); self.end_headers(); return
+        if text == 'busy':
+            self.send_response(529); self.end_headers(); return
+        if text == 'invalid-question':
+            self.send_response(422); self.send_header('x-request-id', 'req_abc123'); self.end_headers()
+            self.wfile.write(json.dumps({'error': {'message': 'questions[0].choices: bad\nvalue for mock-key'}}).encode()); return
         evidence = None
         if text.startswith('{'):
             try:
@@ -193,6 +209,19 @@ try:
     run("SELECT decision_prob(repeat('x',18000000),'Q')", fail='16 MiB')
     assert len(requests) == before
     assert run("SELECT decision_prob('retry','Q') AS v")[0]['v'] == .8 and attempts == 2
+    # 529 is retried too, waiting at least as long as retry-after-ms asks.
+    started, before = time.monotonic(), len(requests)
+    assert run("SELECT decision_prob('overloaded','Q') AS v")[0]['v'] == .8
+    assert len(requests) == before + 2 and time.monotonic() - started >= 1.2
+    # A server-requested wait above the cap fails at once instead of stalling the query.
+    started, before = time.monotonic(), len(requests)
+    run("SELECT decision_prob('slow-down','Q')", fail='retry after 120 s')
+    assert len(requests) == before + 1 and time.monotonic() - started < 10
+    before = len(requests)
+    run("SELECT decision_prob('busy','Q')", fail='HTTP 529')
+    assert len(requests) == before + 3
+    # Error bodies and request ids are shown; the API key is never echoed.
+    run("SELECT decision_prob('invalid-question','Q')", fail='HTTP 422: questions[0].choices: bad value for [redacted] (request id req_abc123)')
     run("SELECT decision_prob('refuse','Q')", fail='refused')
     run("SELECT decision_prob('invalid','Q')", fail='out of range')
     run("SELECT decision_prob('wrong-name','Q')", fail='identity mismatch')
@@ -238,6 +267,21 @@ try:
     cf(f"SELECT decision_answers('x','{bad}')", fail='may use only letters')
     cf("SELECT decision_choice('unknown','Q',['a','b'])", fail='unknown choice')
     cf("SELECT decision_prob('unauthorized','Q')", fail='Cloudflare Clef HTTP 401')
+    # Clef's own limits: 2-255 choices, 2-10 levels, 13 MiB bodies. Nothing is sent when one is broken.
+    before = len(clef_requests)
+    cf("SELECT decision_choice('x','Q',['a'])", fail='Cloudflare Clef needs at least 2 choices')
+    cf("SELECT decision_score('x','Q',[i::VARCHAR FOR i IN range(11)])", fail='at most 10 score levels')
+    cf("SELECT decision_choice('row ' || i,'Q', CASE WHEN i = 5 THEN ['a'] ELSE ['a','b'] END) FROM range(10) t(i)", fail='at least 2 choices')
+    cf(f"SELECT decision_answers('x','{json.dumps([{'type':'choice','name':'c','instructions':'Q','choices':[{'value':'a'}]}])}')", fail='at least 2 choices')
+    cf("SELECT decision_prob(repeat('x',14000000),'Q')", fail="Cloudflare Clef's 13 MiB request limit")
+    cf(f"SELECT decision_answers('x','{json.dumps([{'type':7,'name':'c','instructions':'Q'}])}')", fail='Unknown question type')
+    assert len(clef_requests) == before
+    rows = cf("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(5) t(i)")
+    assert len(rows) == 5 and len(clef_requests) == before + 2  # 15 MB splits under Clef's limit
+    before = len(requests)
+    run("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(5) t(i)")
+    assert len(requests) == before + 1  # the same rows fit OpenAI's 16 MiB in one request
+    cf("SELECT decision_prob('invalid-question','Q')", fail='Cloudflare Clef HTTP 422: [{"loc":["body","questions"],"msg":"bad criteria"}] (request id ts_req_42)')
     cf("SET decisions_model='gpt'; SELECT decision_prob('x','Q')", fail='clef-flash')
     cf("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='cloudflare';", fail='CLOUDFLARE_API_TOKEN')
     cf("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='cloudflare'; CREATE SECRET (TYPE decisions, API_KEY 'k');", fail='account_id')
@@ -270,6 +314,11 @@ try:
     run("SELECT decision_prob('x','Q')", prefix=no_key % 'https://evil.example/v1', fail='loopback mock server')
     jev("SELECT decision_prob('extra-answer','Q')", fail='answer count mismatch')
     jev("SELECT decision_prob('unauthorized','Q')", fail='TypeSafe Jev HTTP 401')
+    before = len(jev_requests)
+    assert jev("SELECT decision_choice('row 0','Q',['only']) AS v")[0]['v'] == 'only'  # Jev allows one choice
+    jev("SELECT decision_choice('x','Q',[i::VARCHAR FOR i IN range(256)])", fail='TypeSafe Jev accepts at most 255 choices')
+    jev("SELECT decision_score('x','Q',[i::VARCHAR FOR i IN range(11)])", fail='TypeSafe Jev accepts at most 10 score levels')
+    assert len(jev_requests) == before + 1
     jev("SET decisions_model='../admin'; SELECT decision_prob('x','Q')", fail="Invalid decisions_model '../admin'")
     jev("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='jev';", fail='TYPESAFE_API_KEY')
     env_only = jev_setup.replace("CREATE SECRET (TYPE decisions, API_KEY 'jev-key');", '')
