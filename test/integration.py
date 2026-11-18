@@ -274,12 +274,14 @@ try:
     rows = run("SELECT decision_choice('row 1','Q', CASE WHEN i < 4 THEN ['a','b'] ELSE ['a','b','c'] END) AS v FROM range(6) t(i)")
     assert [r['v'] for r in rows] == ['b'] * 6 and len(requests) == before + 2  # options are part of the question
     # Detail functions: confidence, per-option probabilities (scores keyed by level label), model.
-    detail = run("SELECT d.choice, d.confidence, d.probabilities['a'] AS pa, d.probabilities['b'] AS pb, map_keys(d.probabilities) AS k, d.model "
+    # The CI CLI is built without the json extension, so -json prints lists as plain text:
+    # select scalars only (array_to_string for key order, element access for values).
+    detail = run("SELECT d.choice, d.confidence, d.probabilities['a'] AS pa, d.probabilities['b'] AS pb, array_to_string(map_keys(d.probabilities), ',') AS k, d.model "
                  "FROM (SELECT decision_choice_detail('row 1','Q',['a','b']) AS d)")[0]
-    assert detail == {'choice': 'b', 'confidence': .6, 'pa': .3, 'pb': .7, 'k': ['a', 'b'], 'model': 'gpt-6-luna-2026-10-01'}, detail
-    detail = run("SELECT d.score, d.confidence, map_keys(d.probabilities) AS k, map_values(d.probabilities) AS v "
+    assert detail == {'choice': 'b', 'confidence': .6, 'pa': .3, 'pb': .7, 'k': 'a,b', 'model': 'gpt-6-luna-2026-10-01'}, detail
+    detail = run("SELECT d.score, d.confidence, array_to_string(map_keys(d.probabilities), ',') AS k, d.probabilities['low'] AS lo, d.probabilities['mid'] AS mid, d.probabilities['high'] AS hi "
                  "FROM (SELECT decision_score_detail('yes','Severity?',['low','mid','high']) AS d)")[0]
-    assert detail == {'score': 1.25, 'confidence': .4, 'k': ['low', 'mid', 'high'], 'v': [0, .75, .25]}, detail
+    assert detail == {'score': 1.25, 'confidence': .4, 'k': 'low,mid,high', 'lo': 0, 'mid': .75, 'hi': .25}, detail
     rows = run("SELECT (decision_choice_detail('row ' || i,'Q',['a','b','c'])).choice AS v FROM range(6) t(i)")
     assert [r['v'] for r in rows] == ['a', 'b', 'c'] * 2  # batched rows map back correctly
     detail = run("SELECT d.confidence IS NULL AS c, d.probabilities IS NULL AS p, d.choice FROM (SELECT decision_choice_detail('no-dist','Q',['a','b']) AS d)")[0]
@@ -367,8 +369,8 @@ try:
     cf(f"SELECT decision_answers('x','{bad}')", fail='may use only letters')
     cf("SELECT decision_choice('unknown','Q',['a','b'])", fail='unknown choice')
     cf("SELECT decision_prob('unauthorized','Q')", fail='Cloudflare Clef HTTP 401')
-    detail = cf("SELECT d.choice, d.confidence, map_values(d.probabilities) AS v, d.model FROM (SELECT decision_choice_detail('yes','Q',['a','b']) AS d)")[0]
-    assert detail == {'choice': 'a', 'confidence': .5, 'v': [.5, .5], 'model': 'clef'}, detail
+    detail = cf("SELECT d.choice, d.confidence, d.probabilities['a'] AS pa, d.probabilities['b'] AS pb, d.model FROM (SELECT decision_choice_detail('yes','Q',['a','b']) AS d)")[0]
+    assert detail == {'choice': 'a', 'confidence': .5, 'pa': .5, 'pb': .5, 'model': 'clef'}, detail
     # Clef's own limits: 2-255 choices, 2-10 levels, 13 MiB bodies. Nothing is sent when one is broken.
     before = len(clef_requests)
     cf("SELECT decision_choice('x','Q',['a'])", fail='Cloudflare Clef needs at least 2 choices')
@@ -399,8 +401,8 @@ try:
     assert jev("SELECT decision_choice('yes','Route?', ['billing','other']) AS v")[0]['v'] == 'billing'
     assert jev_requests[-1]['questions']['decision']['criteria'] == {'billing': 'billing', 'other': 'other'}
     assert jev("SELECT decision_score('yes','Severity?', ['low','medium','high']) AS v")[0]['v'] == 1.25
-    detail = jev("SELECT d.score, map_keys(d.probabilities) AS k, map_values(d.probabilities) AS v, d.model FROM (SELECT decision_score_detail('yes','Severity?',['low','medium','high']) AS d)")[0]
-    assert detail == {'score': 1.25, 'k': ['low', 'medium', 'high'], 'v': [0, .75, .25], 'model': 'jev-1.14.0'}, detail  # the resolved version
+    detail = jev("SELECT d.score, array_to_string(map_keys(d.probabilities), ',') AS k, d.probabilities['medium'] AS mid, d.probabilities['high'] AS hi, d.model FROM (SELECT decision_score_detail('yes','Severity?',['low','medium','high']) AS d)")[0]
+    assert detail == {'score': 1.25, 'k': 'low,medium,high', 'mid': .75, 'hi': .25, 'model': 'jev-1.14.0'}, detail  # the resolved version
     before = len(jev_requests)
     rows = jev("SET decisions_batch_size=128; SELECT decision_prob('row ' || i,'Q') AS v FROM range(130) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(130)]
