@@ -129,6 +129,8 @@ private:
 // host would reject is never sent (or paid for).
 inline void CheckLimits(const ProviderSpec &spec, const Json &questions) {
     if (!questions.is_array()) return; // shape errors are reported by Evaluate
+    if (spec.max_questions && questions.size() > spec.max_questions)
+        throw std::runtime_error(spec.display_name + " accepts at most " + std::to_string(spec.max_questions) + " questions per request");
     for (const auto &q : questions) {
         if (!q.is_object()) continue;
         if (q.contains("type") && q["type"] == "choice" && q.contains("choices") && q["choices"].is_array()) {
