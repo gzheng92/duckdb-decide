@@ -192,6 +192,24 @@ try:
     rows = run("SELECT decision_prob('row ' || i,'Q') AS v FROM range(2065) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(2065)]
     assert len(requests) == before + 104  # 103 batches for 2048 rows, one for 17
+    # Identical (input, question) rows in a chunk are sent once and share the answer.
+    before = len(requests)
+    rows = run("SELECT decision_prob('row ' || (i % 3),'Q') AS v FROM range(12) t(i)")
+    assert [r['v'] for r in rows] == [[.9, .1, .9][i % 3] for i in range(12)]
+    assert len(requests) == before + 1 and len(requests[-1]['questions']) == 3
+    before = len(requests)
+    rows = run("SELECT decision_prob('same','Q') AS v FROM range(50)")
+    assert [r['v'] for r in rows] == [.8] * 50 and len(requests) == before + 1
+    assert 'rows' not in requests[-1]['input']  # one distinct row is sent unbatched
+    before = len(requests)
+    rows = run("SELECT decision('row 0','Q', CASE WHEN i % 2=0 THEN .95 ELSE .05 END) AS v FROM range(4) t(i)")
+    assert [r['v'] for r in rows] == [False, True, False, True] and len(requests) == before + 1
+    before = len(requests)
+    rows = run("SELECT decision_prob('row 1','Q' || (i % 2)) AS v FROM range(6) t(i)")
+    assert len(requests) == before + 2  # a different question is a different decision
+    before = len(requests)
+    rows = run("SELECT decision_choice('row 1','Q', CASE WHEN i < 4 THEN ['a','b'] ELSE ['a','b','c'] END) AS v FROM range(6) t(i)")
+    assert [r['v'] for r in rows] == ['b'] * 6 and len(requests) == before + 2  # options are part of the question
     for size in [0,129]:
         before = len(requests)
         run(f"SET decisions_batch_size={size}; SELECT decision_prob('x','Q')", fail='between 1 and 128')
@@ -203,7 +221,7 @@ try:
     run("SELECT decision_prob(x,'Q') FROM (VALUES ('yes'), ('invalid')) t(x)", fail='out of range')
     assert len(requests) == before + 1
     before = len(requests)
-    rows = run("SELECT decision_prob(repeat('x',3000000),'Q') AS v FROM range(6)")
+    rows = run("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(6) t(i)")
     assert len(rows) == 6 and len(requests) == before + 2
     before = len(requests)
     run("SELECT decision_prob(repeat('x',18000000),'Q')", fail='16 MiB')
@@ -236,6 +254,9 @@ try:
     questions = json.dumps([{'type':'predicate','name':'one','instructions':'Q'}, {'type':'predicate','name':'two','instructions':'Q2'}])
     rows = run(f"SELECT decision_answers('x','{questions}') AS v")
     assert len(json.loads(rows[0]['v'])) == 2
+    before = len(requests)
+    rows = run(f"SELECT decision_answers('x','{questions}') AS v FROM range(5)")
+    assert len(rows) == 5 and len(set(r['v'] for r in rows)) == 1 and len(requests) == before + 1
     rows = run(f"SELECT decision_answers('refuse','{questions}') AS v")
     assert json.loads(rows[0]['v'])[0]['type'] == 'refusal'
     run("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}';", fail='OPENAI_API_KEY')
