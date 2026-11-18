@@ -41,6 +41,7 @@ docs:
     FROM (SELECT decision_choice_detail('I was charged twice.', 'Which team?',
                                         ['support', 'billing', 'shipping']) AS d);
     ```
+
     Non-NULL inputs and instructions are sent to the selected provider and can
     incur API charges.
 
