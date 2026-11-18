@@ -33,7 +33,8 @@ line is DuckDB `v2.0.0` with extension-ci-tools `v2.0-cyanoptera`, and extension
 releases `0.2.*`. Recheck upstream build inputs when upgrading; C++ extension
 artifacts are version- and platform-specific.
 
-DuckDB 1.5.x releases remain on `v1.x` as `0.1.*` GitHub releases; see
+DuckDB versions before 2.0 are no longer supported; the last 1.5.x release is
+`v0.1.1`, and `v1.x` receives no further releases. See
 [RELEASING.md](../RELEASING.md). GitHub release and local build artifacts are
 installed separately from signed community packages.
 

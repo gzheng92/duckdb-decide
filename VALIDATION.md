@@ -100,8 +100,9 @@ instructions and is not a representative accuracy benchmark.
   SQLLogicTest. Windows, macOS, Linux ARM, and the vcpkg dependency resolution
   are covered only by the distribution workflow, not by local runs.
 - Release lines: this branch (`v2.x`) ships `0.2.*` for DuckDB 2.0. DuckDB 1.5.6
-  stays on `v1.x` as `0.1.*`. The 2.0 artifact reports version `0.2.0`; official
-  DuckDB 2.0.0 rejects 1.5.6 builds, so the lines need separate releases.
+  stayed on `v1.x` as `0.1.*` (no longer supported as of November 2026). The 2.0
+  artifact reports version `0.2.0`; official DuckDB 2.0.0 rejects 1.5.6 builds, so
+  the lines needed separate releases.
 
 ## Provider factory — October 30, 2026
 

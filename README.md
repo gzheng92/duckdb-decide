@@ -25,20 +25,21 @@ and run `UPDATE EXTENSIONS (decide);` to pick up the latest community build.
 
 ## DuckDB compatibility
 
-DuckDB loads an extension only into the DuckDB version it was built for, so each
-DuckDB line has its own branch and release series:
+DuckDB loads an extension only into the DuckDB version it was built for. Only
+DuckDB **2.0.x** (LTS) is supported, on the
+[`v2.x`](https://github.com/gzheng92/duckdb-decide/tree/v2.x) branch with extension
+releases `v0.2.*`.
 
-| DuckDB | Branch | Extension releases |
-| --- | --- | --- |
-| 2.0.x (LTS) | [`v2.x`](https://github.com/gzheng92/duckdb-decide/tree/v2.x) | `v0.2.*` |
-| 1.5.x | [`v1.x`](https://github.com/gzheng92/duckdb-decide/tree/v1.x) | `v0.1.*` |
+DuckDB versions before 2.0 are no longer supported. The last release for DuckDB
+1.5.x is [`v0.1.1`](https://github.com/gzheng92/duckdb-decide/releases/tag/v0.1.1);
+its code stays on the [`v1.x`](https://github.com/gzheng92/duckdb-decide/tree/v1.x)
+branch but receives no further fixes or releases. Upgrade to DuckDB 2.0 for new
+features and fixes.
 
 Prebuilt binaries for each release are attached to
-[GitHub Releases](https://github.com/gzheng92/duckdb-decide/releases); pick the release
-matching your DuckDB version. Supported platforms: Linux (x86_64, ARM64), macOS on
-Apple Silicon, and Windows (x86_64). Intel Macs and DuckDB-Wasm are not supported.
-Fixes land on both lines while 1.5.x is supported.
-See [RELEASING.md](RELEASING.md).
+[GitHub Releases](https://github.com/gzheng92/duckdb-decide/releases). Supported
+platforms: Linux (x86_64, ARM64), macOS on Apple Silicon, and Windows (x86_64).
+Intel Macs and DuckDB-Wasm are not supported. See [RELEASING.md](RELEASING.md).
 
 Each release has one zip per platform, holding `decide.duckdb_extension`. Keep that
 file name when you `LOAD` it: DuckDB derives the extension's entry point from the
@@ -120,8 +121,8 @@ Each provider looks for its key in this order:
 3. the provider's environment variable.
 
 > **Version note:** per-provider scopes need extension 0.2.1 or later. Version
-> 0.2.0 and the 1.x line only look for secrets without a scope. On those versions,
-> omit `SCOPE` (for example `CREATE OR REPLACE SECRET openai_key (TYPE decisions, API_KEY
+> 0.2.0 and the unsupported 0.1.x releases only look for secrets without a scope.
+> On those versions, omit `SCOPE` (for example `CREATE OR REPLACE SECRET openai_key (TYPE decisions, API_KEY
 > 'sk-...')`) or use the environment variables below. Those versions support only
 > OpenAI and Cloudflare Clef.
 
@@ -191,13 +192,23 @@ If no secret matches and the environment variable is unset, queries fail with
 it reads its key the same way, from the scope `decisions://<name>` and its
 `key_env` variable.
 
+OpenAI Decisions accepts up to 400 questions per request, 2 to 255 choices, and
+2 to 10 score levels, and an input of up to 10 MB; the extension keeps OpenAI
+requests under 9 MiB so batched input stays within that. Since general
+availability, OpenAI caches a long input shared across requests automatically
+(see `cached_tokens` in your usage); typed functions batch different rows into
+each request, so expect few cache hits from them.
+
 Jev and Clef share the "System One" request format. Predicates become `noul`
 questions, choices `choice`, and scores `score` (a probability-weighted index
 starting at 0), so results mean the same as with OpenAI. Neither returns refusal
 answers. Clef has extra limits: 64 questions per request (so batches are capped
-at 64), question names of letters, digits, `_`, `.`, `-` only, and truncation of
-long text to fit its 65,536-token context. Jev has no question cap and a
-64K-token request limit (32K for the input plus any one question). Images are
+at 64), 13 MiB per request (larger batches are split), 2 to 255 choices, 2 to 10
+score levels, question names of letters, digits, `_`, `.`, `-` only, and
+truncation of long text to fit its 65,536-token context. Jev has no question cap,
+1 to 255 choices, up to 10 score levels, and a 64K-token request limit (32K for
+the input plus any one question). Option counts are checked for every row before
+any request is sent. Images are
 not supported for any provider.
 
 ### Adding a provider
@@ -230,12 +241,44 @@ small C++ class registered in `WireFormats()` in `src/include/providers.hpp`.
 | `decision_prob(input, question)` | DOUBLE, probability the condition is true |
 | `decision_choice(input, question, labels)` | VARCHAR, one supplied label |
 | `decision_score(input, question, ordered_labels)` | DOUBLE, weighted level index starting at 0 |
+| `decision_choice_detail(input, question, labels)` | STRUCT(choice, confidence, probabilities, model) |
+| `decision_score_detail(input, question, ordered_labels)` | STRUCT(score, confidence, probabilities, model) |
 | `decision_answers(input, questions_json)` | VARCHAR containing the answers JSON array |
 
 Any top-level NULL argument produces SQL NULL without making a request. Empty,
 duplicate, or NULL option labels are errors. Typed functions raise an error on
 refusal instead of turning it into false or zero. `decision_answers` preserves
-refusal objects alongside successful answers. For option descriptions and multiple
+refusal objects alongside successful answers. 
+The detail functions return the same answer as `decision_choice` and
+`decision_score`, plus what the provider reports about it:
+
+- `confidence`: DOUBLE from 0 (probability spread evenly) to 1 (all on one option).
+- `probabilities`: MAP(VARCHAR, DOUBLE) from each label to its probability, in
+  the order you gave them. Score levels are keyed by label, not index.
+- `model`: the model id that answered. Providers often resolve an alias to a
+  version (Jev reports a version such as `jev-1.14.0` for `jev-latest`); when a response names no
+  model, this is the requested model.
+
+`confidence` and `probabilities` are NULL when a provider omits them. A
+distribution that is present must cover exactly the supplied labels, with values
+from 0 to 1 summing to 1, or the query fails. Use them to route uncertain rows to
+review instead of acting on them:
+
+```sql
+WITH d AS (
+  SELECT ticket_id, decision_choice_detail(body, 'Which team?', ['support', 'billing', 'shipping']) AS r
+  FROM tickets
+)
+SELECT ticket_id, r.choice,
+       CASE WHEN r.confidence >= 0.8 THEN 'auto' WHEN r.confidence >= 0.4 THEN 'review' ELSE 'manual' END AS route,
+       r.probabilities['billing'] AS billing_share, r.model
+FROM d;
+```
+
+Pick the cutoffs from labeled examples; confidence describes the spread of the
+answer, not whether it is correct.
+
+For option descriptions and multiple
 independent questions about a shared input, pass the documented questions array:
 
 ```sql
@@ -255,7 +298,10 @@ each DuckDB chunk, rows with identical questions and options are grouped. Each
 request contains a JSON array of records, with one uniquely named question that
 explicitly targets each record. Results are checked for matching names, types,
 and counts before they are assigned back to SQL rows. NULL rows are skipped.
-Large batches are split to stay within the 16 MiB request limit.
+Rows with the same input, question, and options are sent once per chunk, and
+every copy gets that answer (each `decision` row still applies its own
+threshold), so repeated values cost one evaluation per chunk. Large batches are
+split to stay within the provider's request limit (16 MiB at most).
 
 ```sql
 SET decisions_batch_size = 20; -- allowed extension range: 1 through 128
@@ -266,18 +312,43 @@ Batching shares evidence across records, so compare results against batch size 1
 on representative labeled data before choosing a larger batch. This is an
 extension technique using multiple API questions, not a native multi-input API.
 `decision_answers` preserves user-defined question names and makes one request
-per row; its explicit questions already share that row's input.
+per distinct row (identical input and questions in a chunk share one request);
+its explicit questions already share that row's input.
 
-Requests execute sequentially within each chunk. There is no persistent cache or
-extension-managed concurrency pool. Functions are marked volatile to prevent the
-SQL optimizer from precomputing network calls. Repeating calls can incur repeated
-charges, so materialize results you plan to reuse.
+Each chunk's requests run up to **4 at a time** by default:
 
-Requests time out after 30 seconds (10-second connection timeout). HTTP 429 is
-retried at most twice with backoff; transport failures are not retried because
-billing status is ambiguous. Other HTTP failures are surfaced by status code;
-response bodies, input text, and API keys are not logged by the HTTP client.
-The extension limits request and response payloads to 16 MiB. It respects
+```sql
+SET decisions_concurrency = 8; -- allowed range: 1 through 32
+SET decisions_concurrency = 1; -- one request at a time
+```
+
+Results keep row order. The first failed request in a chunk (for example an HTTP
+error) stops new requests and aborts those in flight, and that first error is
+reported; requests already sent may still be billed. Refusals are answers, so they
+are reported once the chunk's requests finish. Ctrl-C
+and other query interrupts abort in-flight requests and retry waits within about
+a second. DuckDB can run several chunks at once on its own threads, so the
+number of requests in flight can reach `decisions_concurrency` times the thread
+count; lower either setting (or `SET threads`) if your provider rate-limits you.
+
+Deduplication applies only within a chunk (about 2,048 rows); there is no
+persistent cache across chunks or queries. To evaluate each value exactly once
+across a whole table, run the function over `SELECT DISTINCT` and join back.
+Functions are marked volatile to prevent the SQL optimizer from precomputing
+network calls. Repeating calls can incur repeated charges, so materialize results
+you plan to reuse.
+
+Requests time out after 30 seconds (10-second connection timeout). HTTP 429
+(rate limited), 503 (OpenAI: overloaded), and 529 (System One: overloaded) are
+retried at most twice with backoff, except a 429 for an exhausted quota, which
+fails at once. Retries wait at least as long as the server's `Retry-After` or `retry-after-ms`
+header asks; if the server asks for more than 20 seconds, the query fails at once
+with that wait in the message. Transport failures are not retried because
+billing status is ambiguous. Other HTTP failures are reported by status code, with
+the server's explanation (up to 300 characters, API key redacted) and its request
+id when it sends one. Input text and API keys are not logged by the HTTP client.
+The extension limits request and response payloads to 16 MiB, or less when the
+provider file sets `max_request_mib`. It respects
 DuckDB's `enable_external_access=false` setting. Images and custom regional
 endpoints are not supported.
 

@@ -1,6 +1,8 @@
 #pragma once
 #include "json.hpp"
 #include "providers.hpp"
+#include <algorithm>
+#include <cctype>
 #include <map>
 #include <regex>
 #include <curl/curl.h>
@@ -9,7 +11,9 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 #include <chrono>
+#include <functional>
 namespace decide {
 using Json = nlohmann::ordered_json;
 constexpr size_t MAX_BYTES = 16 * 1024 * 1024;
@@ -23,6 +27,11 @@ struct Config {
     const ProviderSpec &Spec() const { return provider->spec; }
     const std::string &Name() const { return Spec().display_name; }
     std::string Model() const { return model.empty() ? Spec().default_model : model; }
+    // Largest request body to send: the provider's limit, or the extension's 16 MiB.
+    size_t MaxBytes() const { return Spec().max_request_mib ? Spec().max_request_mib * 1024 * 1024 : MAX_BYTES; }
+    std::string LimitText() const {
+        return Spec().max_request_mib ? "the " + std::to_string(Spec().max_request_mib) + " MiB request limit for " + Name() : "extension's 16 MiB limit";
+    }
     std::string Url() const {
         if (!endpoint.empty()) return endpoint;
         std::string url = Spec().url;
@@ -80,6 +89,45 @@ inline double Number(const Json &a, const char *field, double low, double high) 
     if (!std::isfinite(n) || n < low || n > high) throw std::runtime_error("Decision answer out of range");
     return n;
 }
+// An answer's probability for each key, in key order, or null when the answer has none.
+// Keys are choice values, or level indexes as strings for scores. OpenAI sends an array of
+// {value, probability}; System One sends an object keyed the same way. A distribution that is
+// present must cover exactly these keys, each in [0, 1], summing to 1.
+inline Json Distribution(const Json &a, const std::vector<std::string> &keys) {
+    if (!a.contains("probabilities") || a["probabilities"].is_null()) return nullptr;
+    auto invalid = [] { return std::runtime_error("Invalid probability distribution in decision answer"); };
+    Json p = a["probabilities"];
+    if (p.is_array()) {
+        Json map = Json::object();
+        for (const auto &entry : p) {
+            if (!entry.is_object() || !entry.contains("value") || !entry.contains("probability")) throw invalid();
+            const auto &value = entry["value"];
+            std::string key;
+            if (value.is_string()) key = value.get<std::string>();
+            else if (value.is_number_integer()) key = std::to_string(value.get<long long>());
+            else throw invalid();
+            if (map.contains(key)) throw invalid();
+            map[key] = entry["probability"];
+        }
+        p = std::move(map);
+    }
+    if (!p.is_object() || p.size() != keys.size()) throw invalid();
+    Json out = Json::array();
+    double sum = 0;
+    for (const auto &key : keys) {
+        if (!p.contains(key)) throw invalid();
+        double v = Number(p, key.c_str(), 0, 1);
+        sum += v;
+        out.push_back(v);
+    }
+    if (std::fabs(sum - 1) > 0.01) throw std::runtime_error("Decision answer probabilities do not sum to 1");
+    return out;
+}
+// An answer's confidence in [0, 1], or null when the answer has none.
+inline Json Confidence(const Json &a) {
+    if (!a.contains("confidence") || a["confidence"].is_null()) return nullptr;
+    return Number(a, "confidence", 0, 1);
+}
 inline Json Answers(const Json &response, const Json &questions) {
     if (!response.is_object() || !response.contains("answers") || !response["answers"].is_array() || response["answers"].size() != questions.size()) throw std::runtime_error("Decision response answer count mismatch");
     const auto &answers = response["answers"];
@@ -104,7 +152,83 @@ inline size_t Receive(char *data, size_t size, size_t count, void *target) {
     if (bytes > MAX_BYTES - buffer.size()) return 0;
     buffer.append(data, bytes); return bytes;
 }
-inline Json Evaluate(const Config &c, const std::string &input, const Json &questions) {
+constexpr long MAX_RETRY_WAIT_MS = 20000; // longest server-requested wait honoured before giving up
+// Response headers used for retries and error messages.
+struct ResponseHeaders {
+    long retry_after_ms = -1; // from retry-after-ms or retry-after (seconds); -1 if absent
+    std::string request_id;
+};
+inline size_t ReceiveHeader(char *data, size_t size, size_t count, void *target) {
+    auto &headers = *static_cast<ResponseHeaders *>(target);
+    std::string line(data, size * count);
+    auto colon = line.find(':');
+    if (colon == std::string::npos) return size * count;
+    std::string name = line.substr(0, colon), value = line.substr(colon + 1);
+    std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return std::tolower(ch); });
+    auto trim = [](std::string &v) {
+        v.erase(0, v.find_first_not_of(" \t"));
+        auto end = v.find_last_not_of(" \t\r\n");
+        v.erase(end == std::string::npos ? 0 : end + 1);
+    };
+    trim(value);
+    // Only plain numbers are honoured; an HTTP-date Retry-After falls back to the default backoff.
+    auto number = [](const std::string &v) -> long {
+        if (v.empty() || v.size() > 9 || v.find_first_not_of("0123456789") != std::string::npos) return -1;
+        return std::stol(v);
+    };
+    if (name == "retry-after-ms") { auto ms = number(value); if (ms >= 0) headers.retry_after_ms = ms; }
+    if (name == "retry-after" && headers.retry_after_ms < 0) { auto sec = number(value); if (sec >= 0) headers.retry_after_ms = sec * 1000; }
+    if ((name == "x-typesafe-request-id" || name == "x-request-id" || name == "cf-ray") && headers.request_id.empty()) {
+        static const std::regex safe("[A-Za-z0-9._:-]{1,128}");
+        if (std::regex_match(value, safe)) headers.request_id = value;
+    }
+    return size * count;
+}
+// OpenAI answers 429 both for rate limits, which clear, and for an exhausted quota or budget,
+// which retrying cannot fix.
+inline bool QuotaExhausted(const std::string &body) {
+    auto json = Json::parse(body, nullptr, false);
+    if (json.is_discarded() || !json.is_object() || !json.contains("error") || !json["error"].is_object()) return false;
+    const auto &error = json["error"];
+    for (const char *field : {"code", "type"})
+        if (error.contains(field) && error[field] == "insufficient_quota") return true;
+    return false;
+}
+// A short, single-line explanation from an error body: TypeSafe's "detail", OpenAI's
+// error.message, or Cloudflare's errors[0].message. Empty when the body has none.
+inline std::string ErrorDetail(const std::string &body, const std::string &key) {
+    auto json = Json::parse(body, nullptr, false);
+    if (json.is_discarded() || !json.is_object()) return "";
+    Json detail;
+    if (json.contains("detail")) detail = json["detail"];
+    else if (json.contains("error") && json["error"].is_object() && json["error"].contains("message")) detail = json["error"]["message"];
+    else if (json.contains("errors") && json["errors"].is_array() && !json["errors"].empty() && json["errors"][0].is_object() && json["errors"][0].contains("message")) detail = json["errors"][0]["message"];
+    else return "";
+    auto text = detail.is_string() ? detail.get<std::string>() : detail.dump();
+    if (!key.empty()) for (size_t at; (at = text.find(key)) != std::string::npos;) text.replace(at, key.size(), "[redacted]");
+    for (auto &ch : text) if (static_cast<unsigned char>(ch) < 0x20) ch = ' ';
+    if (text.size() > 300) text = text.substr(0, 300) + "...";
+    return text;
+}
+// Returns true once the request should stop: the query was interrupted or another request in
+// the same chunk failed. Checked while transfers run and between retries.
+using Cancelled = std::function<bool()>;
+struct CancelledError : std::runtime_error {
+    CancelledError() : std::runtime_error("request cancelled") {}
+};
+inline int OnProgress(void *target, curl_off_t, curl_off_t, curl_off_t, curl_off_t) {
+    const auto &cancelled = *static_cast<const Cancelled *>(target);
+    return cancelled && cancelled() ? 1 : 0; // nonzero aborts the transfer
+}
+// Global libcurl setup; call before starting request threads.
+inline void InitHttp() {
+    static const auto initialized = [] { if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) throw std::runtime_error("HTTP initialization failed"); return true; }();
+    (void)initialized;
+}
+// served_model, when given, receives the model id the response names (often a resolved version
+// of an alias such as jev-latest), or the requested model when the response names none.
+inline Json Evaluate(const Config &c, const std::string &input, const Json &questions, const Cancelled &cancelled = Cancelled(),
+                     std::string *served_model = nullptr) {
     Validate(c);
     if (!questions.is_array() || questions.empty()) throw std::runtime_error("Questions must be a nonempty array");
     for (const auto &q : questions) {
@@ -113,10 +237,11 @@ inline Json Evaluate(const Config &c, const std::string &input, const Json &ques
         if (q["type"] == "choice" && (!q.contains("choices") || !q["choices"].is_array() || q["choices"].empty())) throw std::runtime_error("Missing choices");
         if (q["type"] == "score" && (!q.contains("levels") || !q["levels"].is_array() || q["levels"].size() < 2)) throw std::runtime_error("Missing score levels");
     }
-    static const auto initialized = [] { if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) throw std::runtime_error("HTTP initialization failed"); return true; }();
-    (void)initialized;
+    CheckLimits(c.Spec(), questions);
+    InitHttp();
+    if (cancelled && cancelled()) throw CancelledError();
     auto payload = c.provider->wire->Encode(c.Model(), input, questions).dump();
-    if (payload.size() > MAX_BYTES) throw std::runtime_error("Request exceeds extension's 16 MiB limit");
+    if (payload.size() > c.MaxBytes()) throw std::runtime_error("Request exceeds " + c.LimitText());
     std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
     if (!curl) throw std::runtime_error("HTTP initialization failed");
     auto *raw = curl_slist_append(nullptr, "Content-Type: application/json");
@@ -134,16 +259,53 @@ inline Json Evaluate(const Config &c, const std::string &input, const Json &ques
     curl_easy_setopt(curl.get(), CURLOPT_NOSIGNAL, 1L);
     curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 0L);
     curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, Receive);
+    curl_easy_setopt(curl.get(), CURLOPT_HEADERFUNCTION, ReceiveHeader);
+    curl_easy_setopt(curl.get(), CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFOFUNCTION, OnProgress);
+    curl_easy_setopt(curl.get(), CURLOPT_XFERINFODATA, &cancelled);
     for (int attempt = 0; attempt < 3; ++attempt) {
         std::string buffer;
+        ResponseHeaders received;
         curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA, &buffer);
-        if (curl_easy_perform(curl.get()) != CURLE_OK) throw std::runtime_error(c.Name() + " transport failed; request not retried");
+        curl_easy_setopt(curl.get(), CURLOPT_HEADERDATA, &received);
+        auto code = curl_easy_perform(curl.get());
+        if (code == CURLE_ABORTED_BY_CALLBACK) throw CancelledError();
+        if (code != CURLE_OK) throw std::runtime_error(c.Name() + " transport failed; request not retried");
         long status; curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &status);
-        if (status == 429 && attempt < 2) { std::this_thread::sleep_for(std::chrono::milliseconds(500 * (1 << attempt))); continue; }
-        if (status < 200 || status >= 300) throw std::runtime_error(c.Name() + " HTTP " + std::to_string(status));
+        // 429 (rate limited), 503 (OpenAI: overloaded) and 529 (System One: overloaded) mean the
+        // request was not processed, so a retry cannot double-bill. Wait at least as long as the
+        // server asks, up to a cap. A 429 for an exhausted quota will not clear, so it fails at once.
+        bool busy = (status == 429 && !QuotaExhausted(buffer)) || status == 503 || status == 529;
+        if (busy && received.retry_after_ms > MAX_RETRY_WAIT_MS)
+            throw std::runtime_error(c.Name() + " HTTP " + std::to_string(status) + "; server asked to retry after " +
+                                     std::to_string((received.retry_after_ms + 999) / 1000) + " s, so the request was not retried");
+        if (busy && attempt < 2) {
+            long wait = std::max<long>(500L * (1 << attempt), received.retry_after_ms);
+            // Sleep in short steps so an interrupt or a failed sibling request ends the wait.
+            for (long slept = 0; slept < wait; slept += 50) {
+                if (cancelled && cancelled()) throw CancelledError();
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::min<long>(50, wait - slept)));
+            }
+            continue;
+        }
+        if (status < 200 || status >= 300) {
+            auto message = c.Name() + " HTTP " + std::to_string(status);
+            auto detail = ErrorDetail(buffer, c.key);
+            if (!detail.empty()) message += ": " + detail;
+            if (!received.request_id.empty()) message += " (request id " + received.request_id + ")";
+            throw std::runtime_error(message);
+        }
         auto response = Json::parse(buffer, nullptr, false);
         if (response.is_discarded()) throw std::runtime_error("Invalid " + c.Name() + " JSON");
-        return Answers(c.provider->wire->Decode(response, questions), questions);
+        auto decoded = c.provider->wire->Decode(response, questions);
+        auto answers = Answers(decoded, questions);
+        if (served_model) {
+            *served_model = c.Model();
+            if (decoded.is_object() && decoded.contains("model") && decoded["model"].is_string() &&
+                SafeModelId(decoded["model"].get<std::string>(), false))
+                *served_model = decoded["model"].get<std::string>();
+        }
+        return answers;
     }
     throw std::runtime_error(c.Name() + " retries exhausted");
 }

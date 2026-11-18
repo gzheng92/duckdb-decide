@@ -5,6 +5,7 @@ import pathlib
 import shutil
 import subprocess
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -14,10 +15,21 @@ requests = []
 clef_requests = []
 jev_requests = []
 attempts = 0
+overloaded = 0
+unavailable = 0
+in_flight = 0
+peak = 0
+lock = threading.Lock()
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
+
+    def handle_one_request(self):
+        try:
+            super().handle_one_request()
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # the client aborted the request, e.g. after another one failed
 
     def do_systemone(self, token, log, wrap):
         """System One format, shared by Cloudflare Clef (wrapped in a REST envelope) and TypeSafe Jev."""
@@ -28,6 +40,9 @@ class Handler(BaseHTTPRequestHandler):
         state = body['state']
         if state == 'unauthorized':
             self.send_response(401); self.end_headers(); return
+        if state == 'invalid-question':
+            self.send_response(422); self.send_header('x-typesafe-request-id', 'ts_req_42'); self.end_headers()
+            self.wfile.write(json.dumps({'detail': [{'loc': ['body', 'questions'], 'msg': 'bad criteria'}]}).encode()); return
         evidence = None
         if state.startswith('{'):
             try:
@@ -46,8 +61,11 @@ class Handler(BaseHTTPRequestHandler):
                 answers[name] = {'type': 'choice', 'choice': pick, 'probabilities': {o: 1 / len(options) for o in options}, 'confidence': .5}
             else:
                 assert isinstance(q['criteria'], list)
-                answers[name] = {'type': 'score', 'score': n % len(q['criteria']) if n is not None else 1.25, 'legend': {}, 'probabilities': {}, 'confidence': .5}
-        reply = {'model': body['model'], 'answers': answers, 'usage': {'input_tokens': 1, 'output_tokens': 0}}
+                levels = len(q['criteria'])
+                dist = {str(i): (1.0 if i == n % levels else 0.0) for i in range(levels)} if n is not None else {str(i): {1: .75, 2: .25}.get(i, 0.0) for i in range(levels)}
+                answers[name] = {'type': 'score', 'score': n % levels if n is not None else 1.25, 'legend': {str(i): c for i, c in enumerate(q['criteria'])}, 'probabilities': dist, 'confidence': .5}
+        model = 'jev-1.14.0' if body['model'] == 'jev-latest' else body['model']  # aliases resolve to versions
+        reply = {'model': model, 'answers': answers, 'usage': {'input_tokens': 1, 'output_tokens': 0}}
         if state == 'extra-answer':
             reply['answers']['surprise'] = {'type': 'noul', 'noul': .5}
         self.send_response(200); self.end_headers()
@@ -55,7 +73,7 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(json.dumps({'success': True, 'result': reply} if wrap and state != 'bare' else reply).encode())
 
     def do_POST(self):
-        global attempts
+        global attempts, overloaded, unavailable, in_flight, peak
         if self.path == '/clef':
             return self.do_systemone('cf-token', clef_requests, wrap=True)
         if self.path == '/v1/systemone':
@@ -72,6 +90,33 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_response(429); self.end_headers(); return
         if text == 'unauthorized':
             self.send_response(401); self.end_headers(); return
+        if text.startswith('sleep '):  # 'sleep <seconds> <id>': a slow answer, counting overlap
+            with lock:
+                in_flight += 1; peak = max(peak, in_flight)
+            try:
+                time.sleep(float(text.split()[1]))
+            finally:
+                with lock:
+                    in_flight -= 1
+            text = 'yes'
+        if text == 'overloaded':
+            overloaded += 1
+            if overloaded == 1:  # the first attempt is overloaded; the retry succeeds
+                self.send_response(529); self.send_header('retry-after-ms', '1200'); self.end_headers(); return
+        if text == 'slow-down':
+            self.send_response(429); self.send_header('Retry-After', '120'); self.end_headers(); return
+        if text == 'unavailable':
+            unavailable += 1
+            if unavailable == 1:
+                self.send_response(503); self.end_headers(); return
+        if text == 'no-quota':
+            self.send_response(429); self.end_headers()
+            self.wfile.write(json.dumps({'error': {'message': 'You exceeded your current quota', 'type': 'insufficient_quota', 'code': 'insufficient_quota'}}).encode()); return
+        if text == 'busy':
+            self.send_response(529); self.end_headers(); return
+        if text == 'invalid-question':
+            self.send_response(422); self.send_header('x-request-id', 'req_abc123'); self.end_headers()
+            self.wfile.write(json.dumps({'error': {'message': 'questions[0].choices: bad\nvalue for mock-key'}}).encode()); return
         evidence = None
         if text.startswith('{'):
             try:
@@ -91,15 +136,32 @@ class Handler(BaseHTTPRequestHandler):
             elif q['type'] == 'predicate':
                 a['probability'] = 2 if record == 'invalid' else (.9 if row_number % 2 == 0 else .1) if row_number is not None else .8
             elif q['type'] == 'choice':
-                a['choice'] = 'unknown' if record == 'unknown' else q['choices'][row_number % len(q['choices']) if row_number is not None else 0]['value']
+                values = [c['value'] for c in q['choices']]
+                a['choice'] = 'unknown' if record == 'unknown' else values[row_number % len(values) if row_number is not None else 0]
+                rest = .3 / max(len(values) - 1, 1)
+                a['probabilities'] = [{'value': v, 'probability': .7 if v == a['choice'] else rest} for v in values]
+                a['confidence'] = .6
             elif q['type'] == 'score':
-                a['score'] = row_number % len(q['levels']) if row_number is not None else 1.25
+                levels = len(q['levels'])
+                a['score'] = row_number % levels if row_number is not None else 1.25
+                weights = {row_number % levels: 1.0} if row_number is not None else {1: .75, 2: .25}
+                a['probabilities'] = [{'value': i, 'label': l['label'], 'probability': weights.get(i, 0.0)} for i, l in enumerate(q['levels'])]
+                a['confidence'] = .4
+            if record == 'no-dist':
+                a.pop('probabilities', None); a.pop('confidence', None)
+            if record == 'bad-sum' and 'probabilities' in a:
+                a['probabilities'][0]['probability'] = 0.9
+            if record == 'bad-keys' and 'probabilities' in a:
+                a['probabilities'][0]['value'] = 'surprise'
+            if record == 'bad-confidence' and 'confidence' in a:
+                a['confidence'] = 1.5
             answers.append(a)
         if text == 'wrong-name':
             answers[0]['name'] = 'unexpected'
         self.send_response(200); self.end_headers()
-        self.wfile.write(json.dumps({'answers': answers}).encode())
+        self.wfile.write(json.dumps({'answers': answers, 'model': 'gpt-6-luna-2026-10-01'}).encode())
 
+ThreadingHTTPServer.request_queue_size = 64  # the default of 5 drops bursts of concurrent connects
 server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 setup = f"""LOAD '{EXT}';
@@ -154,7 +216,7 @@ try:
     rows = run("SELECT decision_prob('row ' || i,'Q') AS v FROM range(45) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(45)]
     assert len(requests) == before + 3
-    assert [len(r['questions']) for r in requests[before:]] == [20, 20, 5]
+    assert sorted(len(r['questions']) for r in requests[before:]) == sorted([20, 20, 5])
     before = len(requests)
     rows = run("SET decisions_batch_size=1; SELECT decision_prob('row ' || i,'Q') AS v FROM range(4) t(i)")
     assert len(requests) == before + 4 and [r['v'] for r in rows] == [.9, .1, .9, .1]
@@ -176,6 +238,67 @@ try:
     rows = run("SELECT decision_prob('row ' || i,'Q') AS v FROM range(2065) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(2065)]
     assert len(requests) == before + 104  # 103 batches for 2048 rows, one for 17
+    # Requests in a chunk run up to decisions_concurrency at a time; results keep row order.
+    def slow(sql):
+        global peak
+        peak = 0
+        started = time.monotonic()
+        rows = run(sql)
+        return rows, time.monotonic() - started
+    before = len(requests)
+    rows, took = slow("SET decisions_batch_size=1; SELECT i, decision_prob('sleep 0.6 ' || i,'Q') AS v FROM range(8) t(i)")
+    assert [r['i'] for r in rows] == list(range(8)) and [r['v'] for r in rows] == [.8] * 8
+    assert len(requests) == before + 8 and peak == 4 and took < 3.5  # default 4: two rounds, not eight
+    rows, took = slow("SET decisions_batch_size=1; SET decisions_concurrency=8; SELECT decision_prob('sleep 0.6 ' || i,'Q') AS v FROM range(8) t(i)")
+    assert peak == 8 and took < 2.5, (peak, took)
+    rows, took = slow("SET decisions_batch_size=1; SET decisions_concurrency=1; SELECT decision_prob('sleep 0.2 ' || i,'Q') AS v FROM range(4) t(i)")
+    assert peak == 1 and took >= .8
+    questions_slow = json.dumps([{'type':'predicate','name':'one','instructions':'Q'}])
+    rows, took = slow(f"SET decisions_concurrency=3; SELECT decision_answers('sleep 0.6 ' || i,'{questions_slow}') AS v FROM range(6) t(i)")
+    assert len(rows) == 6 and peak == 3 and took < 3
+    for size in [0, 33]:
+        run(f"SET decisions_concurrency={size}; SELECT decision_prob('x','Q')", fail='between 1 and 32')
+    # The first failure stops new requests and aborts slow ones already in flight.
+    before = len(requests)
+    started = time.monotonic()
+    run("SET decisions_batch_size=1; SET decisions_concurrency=2; SELECT decision_prob(x,'Q') FROM (VALUES ('unauthorized'), ('sleep 5 a'), ('sleep 5 b'), ('sleep 5 c'), ('sleep 5 d')) t(x)", fail='HTTP 401')
+    assert time.monotonic() - started < 4 and len(requests) - before <= 3
+    # Identical (input, question) rows in a chunk are sent once and share the answer.
+    before = len(requests)
+    rows = run("SELECT decision_prob('row ' || (i % 3),'Q') AS v FROM range(12) t(i)")
+    assert [r['v'] for r in rows] == [[.9, .1, .9][i % 3] for i in range(12)]
+    assert len(requests) == before + 1 and len(requests[-1]['questions']) == 3
+    before = len(requests)
+    rows = run("SELECT decision_prob('same','Q') AS v FROM range(50)")
+    assert [r['v'] for r in rows] == [.8] * 50 and len(requests) == before + 1
+    assert 'rows' not in requests[-1]['input']  # one distinct row is sent unbatched
+    before = len(requests)
+    rows = run("SELECT decision('row 0','Q', CASE WHEN i % 2=0 THEN .95 ELSE .05 END) AS v FROM range(4) t(i)")
+    assert [r['v'] for r in rows] == [False, True, False, True] and len(requests) == before + 1
+    before = len(requests)
+    rows = run("SELECT decision_prob('row 1','Q' || (i % 2)) AS v FROM range(6) t(i)")
+    assert len(requests) == before + 2  # a different question is a different decision
+    before = len(requests)
+    rows = run("SELECT decision_choice('row 1','Q', CASE WHEN i < 4 THEN ['a','b'] ELSE ['a','b','c'] END) AS v FROM range(6) t(i)")
+    assert [r['v'] for r in rows] == ['b'] * 6 and len(requests) == before + 2  # options are part of the question
+    # Detail functions: confidence, per-option probabilities (scores keyed by level label), model.
+    # The CI CLI is built without the json extension, so -json prints lists as plain text:
+    # select scalars only (array_to_string for key order, element access for values).
+    detail = run("SELECT d.choice, d.confidence, d.probabilities['a'] AS pa, d.probabilities['b'] AS pb, array_to_string(map_keys(d.probabilities), ',') AS k, d.model "
+                 "FROM (SELECT decision_choice_detail('row 1','Q',['a','b']) AS d)")[0]
+    assert detail == {'choice': 'b', 'confidence': .6, 'pa': .3, 'pb': .7, 'k': 'a,b', 'model': 'gpt-6-luna-2026-10-01'}, detail
+    detail = run("SELECT d.score, d.confidence, array_to_string(map_keys(d.probabilities), ',') AS k, d.probabilities['low'] AS lo, d.probabilities['mid'] AS mid, d.probabilities['high'] AS hi "
+                 "FROM (SELECT decision_score_detail('yes','Severity?',['low','mid','high']) AS d)")[0]
+    assert detail == {'score': 1.25, 'confidence': .4, 'k': 'low,mid,high', 'lo': 0, 'mid': .75, 'hi': .25}, detail
+    rows = run("SELECT (decision_choice_detail('row ' || i,'Q',['a','b','c'])).choice AS v FROM range(6) t(i)")
+    assert [r['v'] for r in rows] == ['a', 'b', 'c'] * 2  # batched rows map back correctly
+    detail = run("SELECT d.confidence IS NULL AS c, d.probabilities IS NULL AS p, d.choice FROM (SELECT decision_choice_detail('no-dist','Q',['a','b']) AS d)")[0]
+    assert detail == {'c': True, 'p': True, 'choice': 'a'}
+    assert run("SELECT decision_choice_detail(NULL,'Q',['a','b']) IS NULL AS v")[0]['v'] is True
+    run("SELECT decision_choice_detail('bad-sum','Q',['a','b'])", fail='do not sum to 1')
+    run("SELECT decision_score_detail('bad-keys','Q',['a','b','c'])", fail='Invalid probability distribution')
+    run("SELECT decision_choice_detail('bad-confidence','Q',['a','b'])", fail='out of range')
+    assert run("SELECT decision_choice('bad-sum','Q',['a','b']) AS v")[0]['v'] == 'a'  # plain functions ignore the distribution
     for size in [0,129]:
         before = len(requests)
         run(f"SET decisions_batch_size={size}; SELECT decision_prob('x','Q')", fail='between 1 and 128')
@@ -187,12 +310,37 @@ try:
     run("SELECT decision_prob(x,'Q') FROM (VALUES ('yes'), ('invalid')) t(x)", fail='out of range')
     assert len(requests) == before + 1
     before = len(requests)
-    rows = run("SELECT decision_prob(repeat('x',3000000),'Q') AS v FROM range(6)")
+    rows = run("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(6) t(i)")
     assert len(rows) == 6 and len(requests) == before + 2
     before = len(requests)
-    run("SELECT decision_prob(repeat('x',18000000),'Q')", fail='16 MiB')
+    run("SELECT decision_prob(repeat('x',10000000),'Q')", fail='Request exceeds the 9 MiB request limit for OpenAI Decisions')
     assert len(requests) == before
+    # OpenAI GA limits: 2-255 choices, up to 10 levels, 400 questions per request; nothing is sent.
+    run("SELECT decision_choice('x','Q',['only'])", fail='OpenAI Decisions needs at least 2 choices')
+    run("SELECT decision_score('x','Q',[i::VARCHAR FOR i IN range(11)])", fail='OpenAI Decisions accepts at most 10 score levels')
+    many = json.dumps([{'type':'predicate','name':f'q{i}','instructions':'Q'} for i in range(401)])
+    run(f"SELECT decision_answers('x','{many}')", fail='OpenAI Decisions accepts at most 400 questions per request')
+    assert len(requests) == before
+    # 503 (OpenAI's overloaded) is retried; a 429 for an exhausted quota is not.
+    before = len(requests)
+    assert run("SELECT decision_prob('unavailable','Q') AS v")[0]['v'] == .8 and len(requests) == before + 2
+    before = len(requests)
+    run("SELECT decision_prob('no-quota','Q')", fail='HTTP 429: You exceeded your current quota')
+    assert len(requests) == before + 1
     assert run("SELECT decision_prob('retry','Q') AS v")[0]['v'] == .8 and attempts == 2
+    # 529 is retried too, waiting at least as long as retry-after-ms asks.
+    started, before = time.monotonic(), len(requests)
+    assert run("SELECT decision_prob('overloaded','Q') AS v")[0]['v'] == .8
+    assert len(requests) == before + 2 and time.monotonic() - started >= 1.2
+    # A server-requested wait above the cap fails at once instead of stalling the query.
+    started, before = time.monotonic(), len(requests)
+    run("SELECT decision_prob('slow-down','Q')", fail='retry after 120 s')
+    assert len(requests) == before + 1 and time.monotonic() - started < 10
+    before = len(requests)
+    run("SELECT decision_prob('busy','Q')", fail='HTTP 529')
+    assert len(requests) == before + 3
+    # Error bodies and request ids are shown; the API key is never echoed.
+    run("SELECT decision_prob('invalid-question','Q')", fail='HTTP 422: questions[0].choices: bad value for [redacted] (request id req_abc123)')
     run("SELECT decision_prob('refuse','Q')", fail='refused')
     run("SELECT decision_prob('invalid','Q')", fail='out of range')
     run("SELECT decision_prob('wrong-name','Q')", fail='identity mismatch')
@@ -207,6 +355,9 @@ try:
     questions = json.dumps([{'type':'predicate','name':'one','instructions':'Q'}, {'type':'predicate','name':'two','instructions':'Q2'}])
     rows = run(f"SELECT decision_answers('x','{questions}') AS v")
     assert len(json.loads(rows[0]['v'])) == 2
+    before = len(requests)
+    rows = run(f"SELECT decision_answers('x','{questions}') AS v FROM range(5)")
+    assert len(rows) == 5 and len(set(r['v'] for r in rows)) == 1 and len(requests) == before + 1
     rows = run(f"SELECT decision_answers('refuse','{questions}') AS v")
     assert json.loads(rows[0]['v'])[0]['type'] == 'refusal'
     run("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}';", fail='OPENAI_API_KEY')
@@ -223,10 +374,10 @@ try:
     before = len(clef_requests)
     rows = cf("SELECT decision_prob('row ' || i,'Q') AS v FROM range(150) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(150)]
-    assert [len(r['questions']) for r in clef_requests[before:]] == [20] * 7 + [10]
+    assert sorted(len(r['questions']) for r in clef_requests[before:]) == sorted([20] * 7 + [10])
     before = len(clef_requests)
     cf("SET decisions_batch_size=128; SELECT decision_prob('row ' || i,'Q') AS v FROM range(130) t(i)")
-    assert [len(r['questions']) for r in clef_requests[before:]] == [64, 64, 2]
+    assert sorted(len(r['questions']) for r in clef_requests[before:]) == sorted([64, 64, 2])
     rows = cf("SET decisions_model='clef-flash'; SELECT decision_prob('yes','Q') AS v")
     assert clef_requests[-1]['model'] == 'clef-flash'
     questions = json.dumps([{'type':'predicate','name':'one','instructions':'Q'},
@@ -238,6 +389,23 @@ try:
     cf(f"SELECT decision_answers('x','{bad}')", fail='may use only letters')
     cf("SELECT decision_choice('unknown','Q',['a','b'])", fail='unknown choice')
     cf("SELECT decision_prob('unauthorized','Q')", fail='Cloudflare Clef HTTP 401')
+    detail = cf("SELECT d.choice, d.confidence, d.probabilities['a'] AS pa, d.probabilities['b'] AS pb, d.model FROM (SELECT decision_choice_detail('yes','Q',['a','b']) AS d)")[0]
+    assert detail == {'choice': 'a', 'confidence': .5, 'pa': .5, 'pb': .5, 'model': 'clef'}, detail
+    # Clef's own limits: 2-255 choices, 2-10 levels, 13 MiB bodies. Nothing is sent when one is broken.
+    before = len(clef_requests)
+    cf("SELECT decision_choice('x','Q',['a'])", fail='Cloudflare Clef needs at least 2 choices')
+    cf("SELECT decision_score('x','Q',[i::VARCHAR FOR i IN range(11)])", fail='at most 10 score levels')
+    cf("SELECT decision_choice('row ' || i,'Q', CASE WHEN i = 5 THEN ['a'] ELSE ['a','b'] END) FROM range(10) t(i)", fail='at least 2 choices')
+    cf(f"SELECT decision_answers('x','{json.dumps([{'type':'choice','name':'c','instructions':'Q','choices':[{'value':'a'}]}])}')", fail='at least 2 choices')
+    cf("SELECT decision_prob(repeat('x',14000000),'Q')", fail="the 13 MiB request limit for Cloudflare Clef")
+    cf(f"SELECT decision_answers('x','{json.dumps([{'type':7,'name':'c','instructions':'Q'}])}')", fail='Unknown question type')
+    assert len(clef_requests) == before
+    rows = cf("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(5) t(i)")
+    assert len(rows) == 5 and len(clef_requests) == before + 2  # 15 MB splits under Clef's limit
+    before = len(requests)
+    run("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(5) t(i)")
+    assert len(requests) == before + 2  # OpenAI's 9 MiB cap splits them too
+    cf("SELECT decision_prob('invalid-question','Q')", fail='Cloudflare Clef HTTP 422: [{"loc":["body","questions"],"msg":"bad criteria"}] (request id ts_req_42)')
     cf("SET decisions_model='gpt'; SELECT decision_prob('x','Q')", fail='clef-flash')
     cf("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='cloudflare';", fail='CLOUDFLARE_API_TOKEN')
     cf("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='cloudflare'; CREATE SECRET (TYPE decisions, API_KEY 'k');", fail='account_id')
@@ -253,10 +421,12 @@ try:
     assert jev("SELECT decision_choice('yes','Route?', ['billing','other']) AS v")[0]['v'] == 'billing'
     assert jev_requests[-1]['questions']['decision']['criteria'] == {'billing': 'billing', 'other': 'other'}
     assert jev("SELECT decision_score('yes','Severity?', ['low','medium','high']) AS v")[0]['v'] == 1.25
+    detail = jev("SELECT d.score, array_to_string(map_keys(d.probabilities), ',') AS k, d.probabilities['medium'] AS mid, d.probabilities['high'] AS hi, d.model FROM (SELECT decision_score_detail('yes','Severity?',['low','medium','high']) AS d)")[0]
+    assert detail == {'score': 1.25, 'k': 'low,medium,high', 'mid': .75, 'hi': .25, 'model': 'jev-1.14.0'}, detail  # the resolved version
     before = len(jev_requests)
     rows = jev("SET decisions_batch_size=128; SELECT decision_prob('row ' || i,'Q') AS v FROM range(130) t(i)")
     assert [r['v'] for r in rows] == [.9 if i % 2 == 0 else .1 for i in range(130)]
-    assert [len(r['questions']) for r in jev_requests[before:]] == [128, 2]  # no provider cap, unlike Clef
+    assert sorted(len(r['questions']) for r in jev_requests[before:]) == sorted([128, 2])  # no provider cap, unlike Clef
     jev("SET decisions_model='jev-1.14.0'; SELECT decision_prob('yes','Q') AS v")
     assert jev_requests[-1]['model'] == 'jev-1.14.0'
     spaced = json.dumps([{'type':'predicate','name':'has space','instructions':'Q'}])
@@ -270,6 +440,15 @@ try:
     run("SELECT decision_prob('x','Q')", prefix=no_key % 'https://evil.example/v1', fail='loopback mock server')
     jev("SELECT decision_prob('extra-answer','Q')", fail='answer count mismatch')
     jev("SELECT decision_prob('unauthorized','Q')", fail='TypeSafe Jev HTTP 401')
+    before = len(jev_requests)
+    jev("SELECT decision_prob(repeat('x',18000000),'Q')", fail="extension's 16 MiB limit")  # Jev sets no smaller cap
+    rows = jev("SELECT decision_prob(repeat('x',3000000) || i,'Q') AS v FROM range(5) t(i)")
+    assert len(rows) == 5 and len(jev_requests) == before + 1  # 15 MB fits in one request
+    before = len(jev_requests)
+    assert jev("SELECT decision_choice('row 0','Q',['only']) AS v")[0]['v'] == 'only'  # Jev allows one choice
+    jev("SELECT decision_choice('x','Q',[i::VARCHAR FOR i IN range(256)])", fail='TypeSafe Jev accepts at most 255 choices')
+    jev("SELECT decision_score('x','Q',[i::VARCHAR FOR i IN range(11)])", fail='TypeSafe Jev accepts at most 10 score levels')
+    assert len(jev_requests) == before + 1
     jev("SET decisions_model='../admin'; SELECT decision_prob('x','Q')", fail="Invalid decisions_model '../admin'")
     jev("SELECT decision_prob('x','Q')", prefix=f"LOAD '{EXT}'; SET decisions_provider='jev';", fail='TYPESAFE_API_KEY')
     env_only = jev_setup.replace("CREATE SECRET (TYPE decisions, API_KEY 'jev-key');", '')
@@ -283,7 +462,7 @@ CREATE SECRET only_jev (TYPE decisions, API_KEY 'jev-key', SCOPE 'decisions://je
     assert run("SELECT decision_prob('yes','Q') AS v", prefix=scoped + "SET decisions_provider='jev';\n" + jev_setup.split('\n')[2] + '\n')[0]['v'] == .8
     providers = run("SELECT name, format, default_model, key_env, array_to_string(secret_keys, ',') AS secret_keys, max_questions::INTEGER AS max_questions FROM decision_providers() ORDER BY name")
     assert [(p['name'], p['format'], p['default_model'], p['max_questions']) for p in providers] == [
-        ('cloudflare', 'systemone', 'clef', 64), ('jev', 'systemone', 'jev-latest', None), ('openai', 'openai', 'gpt-6-luna', None)]
+        ('cloudflare', 'systemone', 'clef', 64), ('jev', 'systemone', 'jev-latest', None), ('openai', 'openai', 'gpt-6-luna', 400)]
     assert providers[0]['secret_keys'] == 'api_key,account_id' and providers[1]['key_env'] == 'TYPESAFE_API_KEY'
     print('Passed SQL/HTTP integration checks, including batching, NULL mapping, chunk boundaries, payload splitting, and failures; no live API requests.')
 finally:

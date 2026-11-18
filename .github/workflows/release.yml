@@ -1,7 +1,7 @@
 name: Release
 # Releases this branch's DuckDB line: build and test every supported platform,
 # then publish the binaries as a GitHub Release. Start it from the Actions tab on
-# the release branch (v1.x or v2.x), or push a tag matching the branch's version.
+# the release branch (v2.x), or push a tag matching the branch's version.
 # See RELEASING.md.
 on:
   push:

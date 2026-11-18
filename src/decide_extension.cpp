@@ -8,8 +8,12 @@
 #include "duckdb/function/table_function.hpp"
 #include "client.hpp"
 #include "provider_specs.hpp" // generated from providers/*.json at configure time
+#include <atomic>
 #include <cstdlib>
+#include <exception>
 #include <map>
+#include <mutex>
+#include <thread>
 namespace duckdb {
 using decide::Json;
 // Built once from the provider files compiled into the extension; they are checked at load time.
@@ -47,12 +51,55 @@ static decide::Config Configuration(ClientContext &context) {
     }
     return config;
 }
-enum class Mode { Predicate, Probability, Choice, Score, Answers };
+enum class Mode { Predicate, Probability, Choice, Score, Answers, ChoiceDetail, ScoreDetail };
+// Result types of decision_choice_detail and decision_score_detail.
+static LogicalType DetailType(bool choice) {
+    child_list_t<LogicalType> fields;
+    fields.emplace_back(Identifier(choice ? "choice" : "score"), choice ? LogicalType::VARCHAR : LogicalType::DOUBLE);
+    fields.emplace_back(Identifier("confidence"), LogicalType::DOUBLE);
+    fields.emplace_back(Identifier("probabilities"), LogicalType::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE));
+    fields.emplace_back(Identifier("model"), LogicalType::VARCHAR);
+    return LogicalType::STRUCT(std::move(fields));
+}
+// The answer with its confidence and its probability for each option (scores are keyed by
+// level label, in level order), plus the model that answered. Missing fields are NULL.
+static Value DetailValue(bool choice, const Json &question, const Json &answer, const string &model) {
+    vector<string> keys;
+    vector<Value> labels;
+    if (choice) {
+        for (const auto &option : question["choices"]) {
+            keys.push_back(option["value"].get<string>());
+            labels.emplace_back(keys.back());
+        }
+    } else {
+        for (const auto &level : question["levels"]) {
+            keys.push_back(std::to_string(keys.size()));
+            labels.emplace_back(level["label"].get<string>());
+        }
+    }
+    auto distribution = decide::Distribution(answer, keys);
+    auto confidence = decide::Confidence(answer);
+    auto map_type = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE);
+    Value probabilities(map_type);
+    if (!distribution.is_null()) {
+        vector<Value> values;
+        for (const auto &v : distribution) values.emplace_back(Value::DOUBLE(v.get<double>()));
+        probabilities = Value::MAP(LogicalType::VARCHAR, LogicalType::DOUBLE, std::move(labels), std::move(values));
+    }
+    child_list_t<Value> fields;
+    fields.emplace_back(Identifier(choice ? "choice" : "score"),
+                        choice ? Value(answer["choice"].get<string>()) : Value::DOUBLE(answer["score"].get<double>()));
+    fields.emplace_back(Identifier("confidence"), confidence.is_null() ? Value(LogicalType::DOUBLE) : Value::DOUBLE(confidence.get<double>()));
+    fields.emplace_back(Identifier("probabilities"), std::move(probabilities));
+    fields.emplace_back(Identifier("model"), Value(model));
+    return Value::STRUCT(std::move(fields));
+}
 struct PendingRow {
     idx_t row;
     string input;
     Json questions;
     double threshold;
+    vector<PendingRow *> copies; // later rows in the chunk with the same input and question
 };
 struct PendingBatch {
     vector<PendingRow *> rows;
@@ -83,14 +130,63 @@ static void PlanBatch(const decide::Config &config, const vector<PendingRow *> &
         batch.input = Json({{"rows", evidence}}).dump();
     }
     auto bytes = config.provider->wire->Encode(config.Model(), batch.input, batch.questions).dump().size();
-    if (bytes > decide::MAX_BYTES) {
-        if (rows.size() == 1) throw std::runtime_error("Request exceeds extension's 16 MiB limit");
+    if (bytes > config.MaxBytes()) {
+        if (rows.size() == 1) throw std::runtime_error("Request exceeds " + config.LimitText());
         auto middle = rows.begin() + rows.size() / 2;
         PlanBatch(config, vector<PendingRow *>(rows.begin(), middle), batches);
         PlanBatch(config, vector<PendingRow *>(middle, rows.end()), batches);
         return;
     }
     batches.push_back(std::move(batch));
+}
+struct Request {
+    const string *input;
+    const Json *questions;
+};
+// Sends a chunk's requests, up to decisions_concurrency at a time, and returns the answers in
+// request order. The first failure, or an interrupt, stops new requests and aborts the ones in
+// flight; that first error is the one reported.
+static vector<Json> EvaluateAll(ClientContext &context, const decide::Config &config, const vector<Request> &requests,
+                                vector<string> *models = nullptr) {
+    Value setting;
+    context.TryGetCurrentSetting("decisions_concurrency", setting);
+    auto limit = setting.GetValue<uint64_t>();
+    if (limit < 1 || limit > 32) throw std::runtime_error("decisions_concurrency must be between 1 and 32");
+    decide::InitHttp();
+    vector<Json> answers(requests.size());
+    if (models) models->assign(requests.size(), string());
+    std::atomic<bool> failed(false);
+    std::atomic<idx_t> next(0);
+    std::exception_ptr error;
+    std::mutex error_lock;
+    decide::Cancelled cancelled = [&]() { return failed.load() || context.IsInterrupted(); };
+    auto work = [&]() {
+        for (idx_t i; !cancelled() && (i = next++) < requests.size();) {
+            try {
+                answers[i] = decide::Evaluate(config, *requests[i].input, *requests[i].questions, cancelled, models ? &(*models)[i] : nullptr);
+            } catch (...) {
+                std::lock_guard<std::mutex> guard(error_lock);
+                if (!error) error = std::current_exception(); // record before signalling the others
+                failed = true;
+                return;
+            }
+        }
+    };
+    auto workers = MinValue<idx_t>(limit, requests.size());
+    if (workers <= 1) work();
+    else {
+        vector<std::thread> threads;
+        threads.reserve(workers - 1);
+        try {
+            for (idx_t i = 1; i < workers; ++i) threads.emplace_back(work);
+        } catch (...) { failed = true; } // could not start a thread: stop, then report below
+        work();
+        for (auto &thread : threads) thread.join();
+        if (!error && failed) throw std::runtime_error("Could not start request threads");
+    }
+    if (context.IsInterrupted()) throw InterruptException();
+    if (error) std::rethrow_exception(error);
+    return answers;
 }
 template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state, Vector &result) {
     result.SetVectorType(VectorType::FLAT_VECTOR);
@@ -108,7 +204,7 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
             if (MODE == Mode::Answers) questions = Json::parse(instructions);
             else {
                 Json labels = nullptr;
-                if (MODE == Mode::Choice || MODE == Mode::Score) {
+                if (MODE == Mode::Choice || MODE == Mode::Score || MODE == Mode::ChoiceDetail || MODE == Mode::ScoreDetail) {
                     labels = Json::array();
                     auto list = args.data[2].GetValue(row);
                     for (const auto &label : ListValue::GetChildren(list)) {
@@ -116,7 +212,8 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
                         labels.push_back(label.ToString());
                     }
                 }
-                auto type = MODE == Mode::Choice ? "choice" : MODE == Mode::Score ? "score" : "predicate";
+                auto type = MODE == Mode::Choice || MODE == Mode::ChoiceDetail ? "choice"
+                            : MODE == Mode::Score || MODE == Mode::ScoreDetail ? "score" : "predicate";
                 questions = Json::array({decide::Question(type, instructions, labels)});
             }
             double threshold = 0.5;
@@ -128,9 +225,21 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         }
         if (pending.empty()) return;
         auto config = Configuration(state.GetContext());
+        // Check provider limits for every row before any paid request is sent.
+        for (const auto &row : pending) decide::CheckLimits(config.Spec(), row.questions);
         if (MODE == Mode::Answers) {
             // Preserve user-defined names and shared-input semantics for explicit questions.
-            for (const auto &row : pending) result.SetValue(row.row, Value(decide::Evaluate(config, row.input, row.questions).dump()));
+            // Identical (input, questions) rows in the chunk are evaluated once.
+            std::map<std::pair<string, string>, idx_t> index;
+            vector<Request> requests;
+            vector<idx_t> slot;
+            for (const auto &row : pending) {
+                auto inserted = index.emplace(std::make_pair(row.input, row.questions.dump()), requests.size());
+                if (inserted.second) requests.push_back({&row.input, &row.questions});
+                slot.push_back(inserted.first->second);
+            }
+            auto answers = EvaluateAll(state.GetContext(), config, requests);
+            for (idx_t i = 0; i < pending.size(); ++i) result.SetValue(pending[i].row, Value(answers[slot[i]].dump()));
             return;
         }
         Value setting;
@@ -138,8 +247,16 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
         auto batch_size = setting.GetValue<uint64_t>();
         if (batch_size < 1 || batch_size > 128) throw std::runtime_error("decisions_batch_size must be between 1 and 128");
         if (config.Spec().max_questions) batch_size = MinValue<uint64_t>(batch_size, config.Spec().max_questions);
+        // Group rows by question, and send each distinct input once per group; repeats
+        // receive the same answer (each still applies its own threshold).
         std::map<string, vector<PendingRow *>> groups;
-        for (auto &row : pending) groups[row.questions.dump()].push_back(&row);
+        std::map<std::pair<string, string>, PendingRow *> first;
+        for (auto &row : pending) {
+            auto question = row.questions.dump();
+            auto inserted = first.emplace(std::make_pair(row.input, question), &row);
+            if (inserted.second) groups[question].push_back(&row);
+            else inserted.first->second->copies.push_back(&row);
+        }
         vector<PendingBatch> batches;
         for (const auto &entry : groups) {
             const auto &rows = entry.second;
@@ -148,16 +265,26 @@ template <Mode MODE> static void Execute(DataChunk &args, ExpressionState &state
                 PlanBatch(config, vector<PendingRow *>(rows.begin() + start, rows.begin() + end), batches);
             }
         }
-        for (const auto &batch : batches) {
-            auto answers = decide::Evaluate(config, batch.input, batch.questions);
+        vector<Request> requests;
+        for (const auto &batch : batches) requests.push_back({&batch.input, &batch.questions});
+        vector<string> models;
+        auto responses = EvaluateAll(state.GetContext(), config, requests, &models);
+        for (idx_t b = 0; b < batches.size(); ++b) {
+            const auto &batch = batches[b];
+            const auto &answers = responses[b];
             for (idx_t i = 0; i < batch.rows.size(); ++i) {
-                const auto &row = *batch.rows[i];
                 const auto &answer = answers[i];
                 if (answer["type"] == "refusal") throw std::runtime_error(config.Name() + " refused this decision");
-                if (MODE == Mode::Predicate) result.SetValue(row.row, Value(answer["probability"].get<double>() >= row.threshold));
-                if (MODE == Mode::Probability) result.SetValue(row.row, Value(answer["probability"].get<double>()));
-                if (MODE == Mode::Choice) result.SetValue(row.row, Value(answer["choice"].get<string>()));
-                if (MODE == Mode::Score) result.SetValue(row.row, Value(answer["score"].get<double>()));
+                auto assign = [&](const PendingRow &row) {
+                    if (MODE == Mode::Predicate) result.SetValue(row.row, Value(answer["probability"].get<double>() >= row.threshold));
+                    if (MODE == Mode::Probability) result.SetValue(row.row, Value(answer["probability"].get<double>()));
+                    if (MODE == Mode::Choice) result.SetValue(row.row, Value(answer["choice"].get<string>()));
+                    if (MODE == Mode::Score) result.SetValue(row.row, Value(answer["score"].get<double>()));
+                    if (MODE == Mode::ChoiceDetail || MODE == Mode::ScoreDetail)
+                        result.SetValue(row.row, DetailValue(MODE == Mode::ChoiceDetail, row.questions[0], answer, models[b]));
+                };
+                assign(*batch.rows[i]);
+                for (const auto *copy : batch.rows[i]->copies) assign(*copy);
             }
         }
     } catch (const Exception &) { throw; // Keep DuckDB's own error types, e.g. permission errors.
@@ -214,6 +341,7 @@ static void LoadInternal(ExtensionLoader &loader) {
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_endpoint", "Empty for the provider's URL; a loopback http://127.0.0.1 URL for mock tests", LogicalType::VARCHAR, Value(""));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_provider", "Decision provider: " + providers.Names() + "; see decision_providers()", LogicalType::VARCHAR, Value("openai"));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_model", "Model id; empty for the provider's default_model", LogicalType::VARCHAR, Value(""));
+    DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_concurrency", "Requests in flight at once per chunk (1 to 32); 1 sends them one at a time", LogicalType::UBIGINT, Value::UBIGINT(4));
     DBConfig::GetConfig(loader.GetDatabaseInstance()).AddExtensionOption("decisions_batch_size", "Rows per request for typed functions (1 to 128)", LogicalType::UBIGINT, Value::UBIGINT(20));
     auto make = [](const char *name, vector<LogicalType> args, LogicalType output, scalar_function_t fun) {
         ScalarFunction function(name, std::move(args), std::move(output), fun);
@@ -230,6 +358,8 @@ static void LoadInternal(ExtensionLoader &loader) {
     add("decision_prob", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::DOUBLE, Execute<Mode::Probability>);
     add("decision_choice", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, LogicalType::VARCHAR, Execute<Mode::Choice>);
     add("decision_score", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, LogicalType::DOUBLE, Execute<Mode::Score>);
+    add("decision_choice_detail", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, DetailType(true), Execute<Mode::ChoiceDetail>);
+    add("decision_score_detail", {LogicalType::ANY, LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR)}, DetailType(false), Execute<Mode::ScoreDetail>);
     add("decision_answers", {LogicalType::ANY, LogicalType::VARCHAR}, LogicalType::VARCHAR, Execute<Mode::Answers>);
     loader.RegisterFunction(TableFunction("decision_providers", {}, ProvidersScan, ProvidersBind, ProvidersInit));
 }

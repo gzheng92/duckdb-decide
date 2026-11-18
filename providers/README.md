@@ -16,6 +16,9 @@ a provider with `SET decisions_provider = '<name>'`, and
 | `key_env` | yes | Environment variable holding the API key, used when no `decisions` secret matches. |
 | `params` | no | Extra URL values, each `{"name", "pattern", "env"?}`. The value comes from the secret key `name`, or from `env`, and must fully match the regex `pattern`. |
 | `max_questions` | no | Questions per request. Typed functions cap their batches at this size. |
+| `max_request_mib` | no | Request body limit in MiB, 1 to 16. Batches are split to stay under it. The default is the extension's 16 MiB. |
+| `min_choices`, `max_choices` | no | Allowed number of `decision_choice` options. Rows outside the range fail before any request is sent. |
+| `max_levels` | no | Most score levels the host accepts (at least 2). |
 | `question_names` | no | `{"pattern", "rule"}`: regex for question names, and the wording used in errors. |
 | `response_wrapper` | no | Object key the host wraps its response in, such as `result` for Cloudflare's REST API. A bare response is accepted too. |
 | `auth` | no | `{"header", "prefix"?}`. The default is `Authorization: Bearer <key>`. |

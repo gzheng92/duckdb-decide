@@ -12,6 +12,21 @@ SELECT decision(NULL, 'Q') IS NULL, decision_prob('x', NULL) IS NULL,
 ----
 true	true	true	true	true
 
+query II
+SELECT typeof(decision_choice_detail(NULL, 'Q', ['a'])), typeof(decision_score_detail(NULL, 'Q', ['a', 'b']));
+----
+STRUCT(choice VARCHAR, confidence DOUBLE, probabilities MAP(VARCHAR, DOUBLE), model VARCHAR)	STRUCT(score DOUBLE, confidence DOUBLE, probabilities MAP(VARCHAR, DOUBLE), model VARCHAR)
+
+query II
+SELECT decision_choice_detail(NULL, 'Q', ['a']) IS NULL, decision_score_detail('x', NULL, ['a', 'b']) IS NULL;
+----
+true	true
+
+statement error
+SELECT decision_score_detail('x', 'Q', ['a']);
+----
+Invalid Input Error: Decisions: Insufficient choices or score levels
+
 statement error
 SELECT decision_prob('x', '');
 ----

@@ -8,6 +8,10 @@
   "key_env": "CLOUDFLARE_API_TOKEN",
   "params": [{"name": "account_id", "env": "CLOUDFLARE_ACCOUNT_ID", "pattern": "[0-9a-fA-F]{1,64}"}],
   "max_questions": 64,
+  "max_request_mib": 13,
+  "min_choices": 2,
+  "max_choices": 255,
+  "max_levels": 10,
   "question_names": {"pattern": "[A-Za-z0-9_.-]{1,100}", "rule": "letters, digits, '_', '.', '-' (max 100)"},
   "response_wrapper": "result",
   "docs": "https://developers.cloudflare.com/workers-ai/models/clef/"
