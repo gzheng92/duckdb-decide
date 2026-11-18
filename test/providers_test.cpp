@@ -74,6 +74,12 @@ int main(int argc, char **argv) {
     Rejects(with("default_model", "../x"), "invalid default_model");
     Rejects(with("models", Json::array({"m2"})), "default_model must be listed in models");
     Rejects(with("max_questions", 0), "max_questions must be a positive integer");
+    Rejects(with("max_request_mib", 17), "max_request_mib must be a positive integer up to 16");
+    Rejects(with("max_request_mib", 0), "max_request_mib must be a positive integer");
+    Rejects(with("max_levels", 1), "max_levels must be at least 2");
+    Json crossed = with("min_choices", 5);
+    crossed["max_choices"] = 3;
+    Rejects(crossed, "min_choices exceeds max_choices");
     Rejects(with("params", Json::array({{{"name", "unused"}, {"pattern", "x"}}})), "param 'unused' is not used in url");
     Rejects(with("params", Json::array({{{"name", "api_key"}, {"pattern", "x"}}})), "invalid or duplicate param name");
     Rejects(with("auth", {{"header", "Bad Header"}}), "invalid auth header name");
@@ -110,6 +116,28 @@ int main(int argc, char **argv) {
     } catch (const std::exception &e) {
         Expect(std::string(e.what()).find("at most 1 questions") != std::string::npos, "max_questions error");
     }
+
+    // Option-count limits are checked before a request is built.
+    Json counted = base;
+    counted["min_choices"] = 2;
+    counted["max_choices"] = 3;
+    counted["max_levels"] = 3;
+    auto bounded = decide::ParseProvider(counted.dump());
+    auto limit_error = [&](const Json &questions) {
+        try { decide::CheckLimits(bounded.spec, questions); } catch (const std::exception &e) { return std::string(e.what()); }
+        return std::string();
+    };
+    auto choices = [](int n) {
+        Json q = {{"type", "choice"}, {"name", "c"}, {"instructions", "Q"}, {"choices", Json::array()}};
+        for (int i = 0; i < n; ++i) q["choices"].push_back({{"value", std::to_string(i)}});
+        return Json::array({q});
+    };
+    Json levels = Json::array({{{"type", "score"}, {"name", "s"}, {"instructions", "Q"},
+                                {"levels", Json::array({{{"label", "a"}}, {{"label", "b"}}, {{"label", "c"}}, {{"label", "d"}}})}}});
+    Expect(limit_error(choices(1)).find("at least 2 choices") != std::string::npos, "min_choices error");
+    Expect(limit_error(choices(4)).find("at most 3 choices") != std::string::npos, "max_choices error");
+    Expect(limit_error(choices(2)).empty() && limit_error(choices(3)).empty(), "choices within limits");
+    Expect(limit_error(levels).find("at most 3 score levels") != std::string::npos, "max_levels error");
 
     if (failures) return 1;
     std::cout << "Provider files valid: " << files.size() << "; validator checks passed.\n";

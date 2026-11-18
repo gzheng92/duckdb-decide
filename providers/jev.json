@@ -5,5 +5,7 @@
   "url": "https://api.typesafe.ai/v1/systemone",
   "default_model": "jev-latest",
   "key_env": "TYPESAFE_API_KEY",
+  "max_choices": 255,
+  "max_levels": 10,
   "docs": "https://docs.typesafe.ai/api"
 }

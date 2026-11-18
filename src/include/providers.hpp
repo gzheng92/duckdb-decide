@@ -5,6 +5,7 @@
 // shape) everywhere else in the extension; a wire format translates at the HTTP boundary.
 #include "json.hpp"
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <map>
 #include <memory>
@@ -28,6 +29,8 @@ struct ProviderSpec {
     std::vector<std::string> models;  // allowed model ids; empty allows any well-formed id
     std::vector<UrlParam> params;
     size_t max_questions = 0;         // per request; 0 means no provider limit
+    size_t max_request_mib = 0;       // request body limit in MiB; 0 means the extension's 16 MiB
+    size_t min_choices = 0, max_choices = 0, max_levels = 0; // option counts; 0 means no provider limit
     std::string name_pattern;         // question-name regex; empty allows any non-empty name
     std::string name_rule;            // describes name_pattern in error messages
     std::string response_wrapper;     // object key around the response body, if any
@@ -120,6 +123,24 @@ private:
     std::regex names;
 };
 
+// Checks canonical questions against the provider's option-count limits, so a request the
+// host would reject is never sent (or paid for).
+inline void CheckLimits(const ProviderSpec &spec, const Json &questions) {
+    if (!questions.is_array()) return; // shape errors are reported by Evaluate
+    for (const auto &q : questions) {
+        if (!q.is_object()) continue;
+        if (q.contains("type") && q["type"] == "choice" && q.contains("choices") && q["choices"].is_array()) {
+            auto n = q["choices"].size();
+            if (spec.min_choices && n < spec.min_choices)
+                throw std::runtime_error(spec.display_name + " needs at least " + std::to_string(spec.min_choices) + " choices");
+            if (spec.max_choices && n > spec.max_choices)
+                throw std::runtime_error(spec.display_name + " accepts at most " + std::to_string(spec.max_choices) + " choices");
+        }
+        if (q.contains("type") && q["type"] == "score" && q.contains("levels") && q["levels"].is_array() && spec.max_levels && q["levels"].size() > spec.max_levels)
+            throw std::runtime_error(spec.display_name + " accepts at most " + std::to_string(spec.max_levels) + " score levels");
+    }
+}
+
 using WireFormatFactory = std::function<std::unique_ptr<WireFormat>(const ProviderSpec &)>;
 
 // Wire formats by the name provider files use in "format". A new format is one entry here.
@@ -148,7 +169,8 @@ inline Provider ParseProvider(const std::string &text) {
     auto json = Json::parse(text, nullptr, false);
     if (!json.is_object()) throw std::runtime_error("provider file is not a JSON object");
     static const std::set<std::string> known = {"name", "display_name", "format", "url", "default_model", "models", "key_env",
-                                                "params", "max_questions", "question_names", "response_wrapper", "auth", "docs"};
+                                                "params", "max_questions", "max_request_mib", "min_choices", "max_choices",
+                                                "max_levels", "question_names", "response_wrapper", "auth", "docs"};
     for (const auto &item : json.items())
         if (!known.count(item.key())) throw std::runtime_error("unknown provider field '" + item.key() + "'");
     auto text_field = [&](const Json &obj, const char *key, bool required) {
@@ -178,10 +200,19 @@ inline Provider ParseProvider(const std::string &text) {
             s.models.push_back(m.get<std::string>());
         }
     }
-    if (json.contains("max_questions")) {
-        if (!json["max_questions"].is_number_unsigned() || json["max_questions"].get<size_t>() == 0) throw std::runtime_error(s.name + ": max_questions must be a positive integer");
-        s.max_questions = json["max_questions"].get<size_t>();
-    }
+    auto count_field = [&](const char *key, size_t &target, size_t max) {
+        if (!json.contains(key)) return;
+        if (!json[key].is_number_unsigned() || json[key].get<size_t>() == 0 || json[key].get<size_t>() > max)
+            throw std::runtime_error(s.name + ": " + key + " must be a positive integer" + (max == SIZE_MAX ? "" : " up to " + std::to_string(max)));
+        target = json[key].get<size_t>();
+    };
+    count_field("max_questions", s.max_questions, SIZE_MAX);
+    count_field("max_request_mib", s.max_request_mib, 16); // the extension never sends more than 16 MiB
+    count_field("min_choices", s.min_choices, SIZE_MAX);
+    count_field("max_choices", s.max_choices, SIZE_MAX);
+    count_field("max_levels", s.max_levels, SIZE_MAX);
+    if (s.min_choices && s.max_choices && s.min_choices > s.max_choices) throw std::runtime_error(s.name + ": min_choices exceeds max_choices");
+    if (s.max_levels == 1) throw std::runtime_error(s.name + ": max_levels must be at least 2, since scores need two levels");
     if (json.contains("question_names")) {
         const auto &names = json["question_names"];
         if (!names.is_object() || names.size() != 2) throw std::runtime_error(s.name + ": question_names needs exactly 'pattern' and 'rule'");
